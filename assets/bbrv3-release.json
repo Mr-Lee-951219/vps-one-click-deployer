@@ -1,0 +1,13 @@
+{
+  "project": "byJoey/Actions-bbr-v3",
+  "tag": "x86_64-7.2.9",
+  "kernel": "7.2.9-joeyblog-bbrv3",
+  "source_commit": "5f10347280095b41f8597d974b9d7ad3ffa4fe2a",
+  "release_url": "https://github.com/byJoey/Actions-bbr-v3/releases/tag/x86_64-7.2.9",
+  "asset": {
+    "name": "linux-image-7.2.9-joeyblog-bbrv3_7.2.9-1_amd64.deb",
+    "url": "https://github.com/byJoey/Actions-bbr-v3/releases/download/x86_64-7.2.9/linux-image-7.2.9-joeyblog-bbrv3_7.2.9-1_amd64.deb",
+    "sha256": "1f6a03418f0b3cf67de106badf1f7f5b2173875dbc32263a97a921c5dadf7a9d",
+    "size": 141191796
+  }
+}

@@ -1,0 +1,109 @@
+"""One collapsible maintenance card for protection and its nested statistics."""
+import json
+from datetime import datetime
+from pathlib import Path
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QIntValidator
+from PySide6.QtWidgets import (QLabel,QLineEdit,QPlainTextEdit,QVBoxLayout,QHBoxLayout,QFormLayout,
+    QComboBox,QCheckBox,QPushButton,QTableWidget,QTableWidgetItem,QAbstractItemView,QMessageBox,QFileDialog)
+from .widgets import CollapsibleCard
+from .security import validate_policy
+from .maintenance import BEIJING
+
+
+def text(value):
+    label=QLabel(value);label.setWordWrap(True);label.setObjectName('subtitle');return label
+
+
+def action(label, callback):
+    button=QPushButton(label);button.setCursor(Qt.PointingHandCursor);button.clicked.connect(callback);return button
+
+
+class SecurityUi:
+    def build_security(self, page):
+        self.security_card=CollapsibleCard('防爆破','SSH 失败登录自动封禁；只保护实际 SSH 端口。当前管理来源自动加入白名单。统计保存在服务器，关闭软件后继续记录。')
+        page.addWidget(self.security_card);area=self.security_card.area
+        self.security_data={};self.security_rows=[]
+        self.security_summary=text('尚未读取防护状态');area.addWidget(self.security_summary)
+        self.security_retry=QLineEdit('5');self.security_retry.setValidator(QIntValidator(2,30))
+        self.security_window=QLineEdit('10');self.security_window.setValidator(QIntValidator(1,1440))
+        self.security_bantime=QComboBox()
+        for label,seconds in [('15 分钟',900),('1 小时',3600),('24 小时',86400),('7 天',604800),('30 天',2592000),('永久（手动解封）',-1)]:self.security_bantime.addItem(label,seconds)
+        self.security_bantime.setCurrentIndex(1)
+        form=QFormLayout();form.setRowWrapPolicy(QFormLayout.WrapLongRows);form.addRow('失败次数阈值',self.security_retry);form.addRow('观察时间（分钟）',self.security_window);form.addRow('首次封禁时长',self.security_bantime);area.addLayout(form)
+        self.security_increment=QCheckBox('重复尝试延长封禁');self.security_increment.setChecked(True);area.addWidget(self.security_increment)
+        area.addWidget(text('默认按 1 小时 → 24 小时 → 7 天递增；修改首次时长后，后续时长按倍数计算。'))
+        self.security_whitelist=QPlainTextEdit();self.security_whitelist.setMaximumHeight(76);self.security_whitelist.setPlaceholderText('可选白名单：每行一个 IP 或网段，例如 203.0.113.8/32');area.addWidget(self.security_whitelist)
+        area.addWidget(action('启用 / 更新 SSH 防爆破',self.apply_security_dialog))
+        row=QHBoxLayout();row.addWidget(action('停用 SSH 防爆破',lambda:self.confirm_action('security_disable','只停用本软件的 SSH 防护并解除它的封禁，历史统计保留。',self.security_payload())));row.addWidget(action('恢复上一次规则',lambda:self.confirm_action('security_restore','恢复上一次成功保存的规则，当前管理来源仍加入白名单。',self.security_payload())));area.addLayout(row)
+        area.addWidget(text('面板 HTTPS：申请域名证书保护登录信息传输。它不替代 SSH 封禁，也不改变节点线路。'))
+        area.addWidget(action('配置现有面板 HTTPS',self.security_https))
+        area.addWidget(text('若自己被封得无法 SSH 连接，请从服务商网页控制台解封；3x-ui 节点 IP 限制不是 SSH 登录防护。'))
+        title=QLabel('查看统计项');title.setObjectName('section');area.addWidget(title)
+        self.security_range=QComboBox()
+        for label,days in [('今天（北京时间）',1),('最近 7 天',7),('最近 30 天',30),('最近 90 天',90)]:self.security_range.addItem(label,days)
+        area.addWidget(self.security_range)
+        row=QHBoxLayout();row.addWidget(action('刷新防护与统计',lambda:self.start('security_status',self.security_payload())));row.addWidget(action('导出统计',self.export_security));area.addLayout(row)
+        self.security_auto=QCheckBox('每 30 秒自动刷新');self.security_auto.setToolTip('仅在当前防爆破页面展开且没有其他任务时刷新');area.addWidget(self.security_auto)
+        self.security_metrics=text('登录失败 IP：—\n失败次数：—\n当前封禁 IP：—\n所选时间段封禁次数：—');area.addWidget(self.security_metrics)
+        self.security_table=QTableWidget(0,5);self.security_table.setHorizontalHeaderLabels(['IP','失败次数','封禁次数','最近时间（北京）','状态'])
+        self.security_table.setSelectionBehavior(QAbstractItemView.SelectRows);self.security_table.setSelectionMode(QAbstractItemView.SingleSelection);self.security_table.setEditTriggers(QAbstractItemView.NoEditTriggers);self.security_table.setMinimumHeight(170);self.security_table.horizontalHeader().setStretchLastSection(True);area.addWidget(self.security_table)
+        area.addWidget(action('解除所选 IP 的 SSH 封禁',self.unban_security_dialog))
+        self.security_times=text('封禁与解封时间：刷新后显示');area.addWidget(self.security_times)
+        self.security_timer=QTimer(self);self.security_timer.setInterval(30000);self.security_timer.timeout.connect(self.refresh_security_if_visible);self.security_timer.start()
+
+    def security_payload(self):
+        return {'endpoint':self.target_text(),'days':self.security_range.currentData()}
+
+    def apply_security_dialog(self):
+        try:
+            payload={**self.security_payload(),'maxretry':int(self.security_retry.text()),'findtime':int(self.security_window.text())*60,
+                     'bantime':self.security_bantime.currentData(),'increment':self.security_increment.isChecked(),
+                     'whitelist':[x.strip() for x in self.security_whitelist.toPlainText().splitlines() if x.strip()]}
+            policy=validate_policy(payload)
+            length='永久，需手动解封' if policy['bantime']==-1 else str(policy['bantime']//60)+' 分钟'
+            self.confirm_action('security_apply','将在服务器安装 / 配置 Fail2ban。\n%d 分钟内失败 %d 次后封禁，首次时长：%s。\n只保护实际 SSH 端口；当前管理 IP 自动加入白名单。'%(policy['findtime']//60,policy['maxretry'],length),payload)
+        except (ValueError,TypeError) as ex:QMessageBox.warning(self,'请检查防护规则',str(ex))
+
+    def security_https(self):
+        self.focus_certificate();self.tls.setCurrentIndex(self.tls.findData('domain'));self.inputs['domain'].setFocus()
+
+    def refresh_security_if_visible(self):
+        if not self.security_auto.isChecked() or not self.security_card.isExpanded() or self.nav.currentIndex()!=2:return
+        if self.active and self.active.isRunning():return
+        if not self.security_data.get('installed'):return
+        self.start('security_status',self.security_payload())
+
+    def render_security(self, result):
+        self.security_data=result;self.security_rows=result.get('rows',[])
+        policy=result.get('policy',{})
+        management='；管理白名单：'+policy['management_ip'] if policy.get('management_ip') else ''
+        state='SSH 防护状态读取失败' if result.get('state_error') else ('SSH 防爆破已启用' if result.get('enabled') else 'SSH 防爆破未启用')
+        self.security_summary.setText(state+management+'\n'+result.get('note',''))
+        metrics=result.get('metrics',{})
+        metrics={key:('未确认' if value is None else value) for key,value in metrics.items()}
+        self.security_metrics.setText('登录失败 IP：%s\n失败次数：%s\n当前封禁 IP：%s\n所选时间段封禁次数：%s'%(metrics.get('failed_ips','—'),metrics.get('failures','—'),metrics.get('currently_banned','—'),metrics.get('bans','—')))
+        self.security_table.setRowCount(len(self.security_rows))
+        for n,row in enumerate(self.security_rows):
+            recent=datetime.fromtimestamp(row['last'],BEIJING).strftime('%m-%d %H:%M') if row['last'] else '所选时间段无记录'
+            status='未确认' if row['banned'] is None else ('已封禁' if row['banned'] else '未封禁')
+            for col,value in enumerate((row['ip'],str(row['failures']),str(row['bans']),recent,status)):self.security_table.setItem(n,col,QTableWidgetItem(value))
+        if self.security_rows:self.security_table.selectRow(0)
+        self.security_times.setText('实际封禁时间（服务器时间，含解封时间）：\n'+(result.get('ban_times') or '当前没有封禁记录')+'\n统计采集：'+result.get('collector','未安装'))
+        if policy:
+            self.security_retry.setText(str(policy['maxretry']));self.security_window.setText(str(policy['findtime']//60))
+            index=self.security_bantime.findData(policy['bantime'])
+            if index<0:self.security_bantime.addItem(str(policy['bantime']//60)+' 分钟',policy['bantime']);index=self.security_bantime.count()-1
+            self.security_bantime.setCurrentIndex(index);self.security_increment.setChecked(policy['increment']);self.security_whitelist.setPlainText('\n'.join(policy['whitelist']))
+
+    def unban_security_dialog(self):
+        row=self.security_table.currentRow()
+        if not 0<=row<len(self.security_rows):QMessageBox.information(self,'先选择 IP','请刷新统计并选择一个被封禁的 IP。');return
+        item=self.security_rows[row]
+        if not item['banned']:QMessageBox.information(self,'IP 未被封禁','这个 IP 当前没有 SSH 封禁。');return
+        self.confirm_action('security_unban','解除 '+item['ip']+' 的本软件 SSH 封禁；再次违反规则仍可能被封禁。',{**self.security_payload(),'ip':item['ip']})
+
+    def export_security(self):
+        if not self.security_data:QMessageBox.information(self,'请先刷新','刷新防护与统计后再导出。');return
+        path,_=QFileDialog.getSaveFileName(self,'导出防爆破统计','NodePilot-security.json','JSON (*.json)')
+        if path:Path(path).write_text(json.dumps(self.security_data,ensure_ascii=False,indent=2),encoding='utf-8')
