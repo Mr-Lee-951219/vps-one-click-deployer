@@ -40,7 +40,7 @@ class PanelSSH(FakeSSH):
         if command.startswith("python3 - <<'NP_PANEL'"):
             return json.dumps(self.target)
         if command.startswith('fail2ban-client reload '):
-            jail = command.split()[2]
+            jail = command.split()[-1]
             if self.fail_reload and jail == PANEL_JAIL:
                 raise RuntimeError('panel reload error')
             self.running_jails.add(jail)
@@ -50,6 +50,8 @@ class PanelSSH(FakeSSH):
             return ''
         if command == 'fail2ban-client get ' + PANEL_JAIL + ' actions':
             return 'nftables-multiport'
+        if command == 'fail2ban-client get ' + PANEL_JAIL + ' action nftables-multiport port':
+            return str(self.target['port'])
         if command.startswith('fail2ban-client status ') and 'echo active' in command:
             return 'active' if command.split()[2] in self.running_jails else ''
         if command.startswith('mv -f -- '):

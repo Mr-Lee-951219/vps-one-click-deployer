@@ -98,6 +98,10 @@ class FakeSSH:
         if '$SSH_CONNECTION' in command:return '203.0.113.9 54000 192.0.2.1 54887'
         if command.startswith('command -v'):return 'ready'
         if command.startswith('fail2ban-client get ') and command.endswith(' actions'):return 'nftables-multiport'
+        if command.endswith(' actionban'):return 'nft add element inet f2b-table addr-set-test { <ip> }'
+        if command.endswith(' actionunban'):return 'nft delete element inet f2b-table addr-set-test { <ip> }'
+        if command.endswith(' port'):return '54887'
+        if command.endswith(' protocol'):return 'tcp'
         if command.startswith('fail2ban-client reload'):
             if self.fail_reload:raise RuntimeError('reload error')
             self.running=True
@@ -143,7 +147,7 @@ def test_journald_only_debian_retries_configuration_and_waits_for_socket():
     m.ssh.run=run
     assert m.security_apply(payload())['enabled']
     assert len(attempts)==2 and '[sshd]\nbackend = systemd' in m.ssh.files[JOURNAL_FILE]
-    assert m.ssh.commands.index(WAIT_READY)<m.ssh.commands.index('fail2ban-client reload '+JAIL)
+    assert m.ssh.commands.index(WAIT_READY)<m.ssh.commands.index('fail2ban-client reload --restart --if-exists '+JAIL)
     assert any('systemd 日志' in log for log in logs)
 
 

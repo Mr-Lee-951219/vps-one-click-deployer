@@ -72,6 +72,8 @@ def test_existing_manual_server_without_nodepilot_returns_counts_and_banned_ips(
     def command(args):
         if args==['fail2ban-client','status','sshd']:return 0,STATUS
         if args==['fail2ban-client','get','sshd','banip']:return 0,'198.51.100.2 2001:db8::7'
+        if args[-1]=='actions':return 0,'iptables-multiport'
+        if args[-1]=='actionban':return 0,'iptables -I f2b-sshd 1 -s <ip> -j REJECT'
         return 0,'active'
     monkeypatch.setattr(c,'command',command)
     result=c.report(db,1)

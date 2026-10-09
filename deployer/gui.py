@@ -756,6 +756,14 @@ def main():
                 scroll.horizontalScrollBar().setValue(0)
                 app.processEvents()
                 window.grab().save(str(Path(os.environ['NODEPILOT_SMOKE_TEST']).with_suffix('.security.png')))
+                if os.environ.get('NODEPILOT_SMOKE_SECURITY_FAILURE'):
+                    window.render_security({'scope':'ssh','jail':'sshd','enabled':False,'installed':True,
+                        'action_error':'封禁动作缺失；规则能统计不代表能执行封禁，请重新启用 / 更新防护。',
+                        'totals':{'total_failed':91,'total_banned':17,'currently_failed':15},
+                        'metrics':{'failed_ips':3,'failures':31,'bans':4,'currently_banned':0},'rows':[],'policy':{}})
+                    assert '封禁动作异常' in window.security_summary.text()
+                    scroll.ensureWidgetVisible(window.security_summary,0,20);app.processEvents()
+                    window.grab().save(str(Path(os.environ['NODEPILOT_SMOKE_TEST']).with_suffix('.missing-action.png')))
             if os.environ.get('NODEPILOT_SMOKE_CONNECTIVITY'):
                 window.record={'settings':{'host':'192.0.2.1','ssh_port':2222},
                     'ports':{'panel':25000,'vless':25001,'hy2':25002},

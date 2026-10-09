@@ -102,6 +102,36 @@ systemctl start nodepilot-security-stats.service
 
 
 class SecurityMixin:
+    def security_actions(self, jail, expected_port=None):
+        """Read live commands, not just a jail's counters or action display name."""
+        output = self.ssh.run('fail2ban-client get ' + jail + ' actions')
+        names = [line.strip().removeprefix('`- ').removeprefix('|- ').strip()
+                 for line in output.splitlines()]
+        names = [name for name in names if re.fullmatch(r'[A-Za-z0-9_.:-]+', name)]
+        actions = {}
+        for name in names:
+            prefix = 'fail2ban-client get ' + jail + ' action ' + shlex.quote(name) + ' '
+            ban = self.ssh.run(prefix + 'actionban').strip()
+            unban = self.ssh.run(prefix + 'actionunban').strip()
+            if re.search(r'\b(?:nft|iptables|ip6tables)(?:-nft|-legacy)?\b', ban) and re.search(r'\b(?:nft|iptables|ip6tables)(?:-nft|-legacy)?\b', unban):
+                actions[name] = {'ban': ban, 'unban': unban}
+        if not actions:
+            raise RuntimeError('规则没有可用的实际防火墙封禁 / 解封动作，未确认生效')
+        if expected_port is not None:
+            name = 'nftables-multiport'
+            if name not in actions or not re.search(r'\bnft\b', actions[name]['ban']):
+                raise RuntimeError('规则未加载预期的 nftables 封禁动作，未确认生效')
+            prefix = 'fail2ban-client get ' + jail + ' action ' + name + ' '
+            if self.ssh.run(prefix + 'port').strip() != str(expected_port) or self.ssh.run(prefix + 'protocol').strip().lower() != 'tcp':
+                raise RuntimeError('封禁动作的实际端口或协议不匹配，未确认生效')
+        return actions
+
+    def restart_security_jail(self, jail):
+        # Fail2ban 1.0.2 drops a newly added action during an ordinary reload.
+        # Restart only this jail, retaining the database and all other jails.
+        self.ssh.run('fail2ban-client reload --restart --if-exists ' + jail, timeout=90)
+        self.ssh.run('fail2ban-client status ' + jail)
+
     def security_context(self, payload=None):
         scope = (payload or {}).get('scope', 'ssh')
         if scope not in ('ssh', 'panel'):
@@ -152,7 +182,7 @@ class SecurityMixin:
                 result['target_error'] = str(ex)
                 result['note'] = result.get('note', '') + '\n' + str(ex)
         current = result.get('metrics', {}).get('currently_banned')
-        state = '规则需检查或更新' if result.get('target_error') else ('已启用' if result['enabled'] else '未启用或状态不可用')
+        state = '规则需检查或更新' if result.get('target_error') or result.get('action_error') else ('已启用' if result['enabled'] else '未启用或状态不可用')
         self.log(ctx['label'] + ' 防爆破 [' + result.get('jail', ctx['jail']) + ']：' + state + '；当前封禁 ' + (str(current)+' 个 IP' if current is not None else '读取失败'))
         totals = result.get('totals', {})
         if totals:
@@ -201,6 +231,7 @@ class SecurityMixin:
         old_filter = self.ssh.read(PANEL_FILTER) if ctx['scope'] == 'panel' and self.ssh.exists(PANEL_FILTER) else None
         old_journal = self.ssh.read(JOURNAL_FILE) if self.ssh.exists(JOURNAL_FILE) else None
         journal_changed = False
+        runtime_touched = False
         old_policy = self.ssh.json(root + '/policy.json', None)
         self.ssh.write(ROOT + '/collector.py', (self.assets / 'security-collector.py').read_bytes(), 0o700)
         try:
@@ -223,12 +254,11 @@ class SecurityMixin:
                 journal_changed = True
                 self.ssh.write(JOURNAL_FILE, JOURNAL_CONFIG)
                 self.ssh.run('fail2ban-client -t', timeout=90)
+            runtime_touched = True
             self.ssh.run('systemctl enable --now fail2ban', timeout=90)
             self.ssh.run(WAIT_READY, timeout=45)
-            self.ssh.run('fail2ban-client reload ' + jail, timeout=90)
-            self.ssh.run('fail2ban-client status ' + jail)
-            if 'nftables' not in self.ssh.run('fail2ban-client get ' + jail + ' actions'):
-                raise RuntimeError(label + ' 规则未加载实际防火墙封禁动作，未确认生效')
+            self.restart_security_jail(jail)
+            self.security_actions(jail, target['port'])
         except Exception as ex:
             self.log('防爆破启用失败，具体原因：' + str(ex))
             try:
@@ -249,16 +279,22 @@ class SecurityMixin:
                 except Exception as rollback_error:
                     rollback_errors.append(path + '：' + str(rollback_error))
             try:
-                if self.ssh.run('fail2ban-client ping >/dev/null 2>&1 && echo ready || true').strip() == 'ready':
-                    if old is None and not was_running:
+                if runtime_touched and self.ssh.run('fail2ban-client ping >/dev/null 2>&1 && echo ready || true').strip() == 'ready':
+                    if not was_running:
                         active = self.ssh.run('fail2ban-client status '+jail+' >/dev/null 2>&1 && echo active || true').strip()
                         if active:
                             self.ssh.run('fail2ban-client stop ' + jail)
+                            if self.ssh.run('fail2ban-client status '+jail+' >/dev/null 2>&1 && echo active || true').strip():
+                                raise RuntimeError('原先未运行的防护规则仍在运行')
                     else:
-                        self.ssh.run('fail2ban-client reload ' + jail)
+                        self.restart_security_jail(jail)
+                        self.security_actions(jail)
+                elif runtime_touched:
+                    raise RuntimeError('Fail2ban 服务不可用，运行规则未确认恢复')
             except Exception as rollback_error:
                 rollback_errors.append('运行规则：' + str(rollback_error))
-            rollback = '已回读恢复原配置文件；请刷新确认防护状态。'
+            rollback = ('已回读恢复原配置文件，并核对运行规则；请刷新确认防护状态。' if runtime_touched else
+                        '已回读恢复原配置文件；本次尚未更新运行规则。')
             if rollback_errors:
                 rollback = '恢复原规则未全部完成：' + '；'.join(rollback_errors)
             self.log(rollback)
@@ -298,11 +334,18 @@ class SecurityMixin:
             try:
                 self.ssh.write(ctx['file'], '# Managed by NodePilot\n[sshd]\nenabled = false\n')
                 self.ssh.run('fail2ban-client -t', timeout=90)
-            except Exception:
-                if previous is None:self.ssh.run('rm -f -- ' + ctx['file'])
-                else:self.ssh.write(ctx['file'], previous)
-                self.ssh.run('fail2ban-client reload ' + ctx['jail'], check=False)
-                raise
+            except Exception as ex:
+                try:
+                    if previous is None:self.ssh.run('rm -f -- ' + ctx['file'])
+                    else:self.ssh.write(ctx['file'], previous)
+                    if self.ssh.exists(ctx['file']) != (previous is not None) or (previous is not None and self.ssh.read(ctx['file']) != previous):
+                        raise RuntimeError('配置文件回读不一致')
+                    if running:
+                        self.restart_security_jail(ctx['jail'])
+                        self.security_actions(ctx['jail'])
+                except Exception as rollback_error:
+                    raise RuntimeError('停用防护失败：'+str(ex)+'\n恢复原规则未全部完成：'+str(rollback_error)) from ex
+                raise RuntimeError('停用防护失败：'+str(ex)+'\n已核对恢复原配置与运行状态。') from ex
             if previous is not None:self.ssh.write(ctx['root'] + '/disabled-jail.conf', previous)
         else:
             self.ssh.run('mv -f -- ' + ctx['file'] + ' ' + ctx['root'] + '/disabled-jail.conf')

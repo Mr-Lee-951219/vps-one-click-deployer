@@ -125,6 +125,7 @@ class SecurityUi:
         state=name+' 防护状态读取失败' if result.get('state_error') else (name+' 防爆破已启用' if result.get('enabled') else name+' 防爆破未启用')
         if result.get('target_error'):state=name+' 防护规则需检查或更新'
         if policy.get('port'):state+=' · TCP '+str(policy['port'])
+        if result.get('action_error'):state='封禁动作异常 · 请重新启用 / 更新防护'
         if result.get('jail'):state+=' · '+result['jail']
         if len(result.get('available_jails',[]))>1:state+='\n检测到两套 SSH 规则，可切换规则分别查看；统计不合并。'
         self.security_summary.setText(state+management+'\n'+result.get('note',''))

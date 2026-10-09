@@ -234,6 +234,21 @@ def report(db, days):
             except ValueError:
                 pass
     result = summarize(db, days, active)
+    action_error = ''
+    action_code, action_output = command(['fail2ban-client', 'get', JAIL, 'actions']) if status_code == 0 else (1, '')
+    action_names = [line.strip().removeprefix('`- ').removeprefix('|- ').strip() for line in action_output.splitlines()]
+    action_names = [name for name in action_names if re.fullmatch(r'[A-Za-z0-9_.:-]+', name)]
+    if status_code == 0 and (action_code != 0 or not action_names):
+        action_error = '封禁动作缺失或读取失败；规则能统计不代表能执行封禁，请重新启用 / 更新防护。'
+    elif status_code == 0:
+        firewall_action = False
+        for name in action_names[:16]:
+            ban_code, ban = command(['fail2ban-client', 'get', JAIL, 'action', name, 'actionban'])
+            if ban_code == 0 and re.search(r'\b(?:nft|iptables|ip6tables)(?:-nft|-legacy)?\b', ban):
+                firewall_action = True
+                break
+        if not firewall_action:
+            action_error = '未确认可用的防火墙封禁动作；请核对动作命令与防护规则。'
     state_error = (code != 0 and (status_code == 0 or Path(JAIL_FILE).exists())) or (status_code != 0 and code == 0)
     if code != 0:
         result['metrics']['currently_banned'] = None
@@ -249,7 +264,8 @@ def report(db, days):
         for key in ('failed_ips', 'failures', 'bans'):
             result['metrics'][key] = None
     partial = get_meta(db, 'partial', False)
-    result.update(scope=SCOPE, jail=JAIL, enabled=code == 0 and status_code == 0, installed=bool(managed or status_code == 0), managed=managed,
+    result.update(scope=SCOPE, jail=JAIL, enabled=code == 0 and status_code == 0 and not action_error, installed=bool(managed or status_code == 0), managed=managed,
+                  action_error=action_error, action_names=action_names,
                   active_ips=sorted(active) if code == 0 else None,
                   state_error=state_error, service=service, collector=collector if managed else '未安装（刷新时读取已有日志）', policy=policy,
                   totals=totals, status_output=status_output if status_code == 0 else '', log_available=log_available, partial=partial,
@@ -257,11 +273,13 @@ def report(db, days):
                   source=get_meta(db, 'source'), note='按天统计来自可读取的 ' + JAIL + ' 失败与封禁日志；已删除的日志无法补回。累计计数来自 Fail2ban status，可能随服务或规则重启重置，与按天统计分别显示。明细最多 200 行。')
     if not managed:
         result['note'] += ' 当前仅兼容读取已有规则与日志，未安装采集服务或修改防护配置。'
+    if action_error:
+        result['note'] += ' ' + action_error
     if not log_available:
         result['note'] += ' 历史日志读取失败，按天统计未确认；请参考累计计数和当前封禁列表。'
     if partial:
         result['note'] += ' 日志超过单次读取上限，本次按天统计不完整。'
-    if not result['enabled'] and not state_error:
+    if not result['enabled'] and not state_error and not action_error:
         result['note'] += ' 此规则未运行或 Fail2ban 不可用；有历史记录也不代表当前在防护。'
     if state_error:
         result['note'] += ' 防护规则已配置，但 Fail2ban 状态读取失败，请检查服务日志；当前封禁数量未知。'
