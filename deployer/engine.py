@@ -171,7 +171,7 @@ class Engine(MaintenanceMixin, BackupMixin, PublicPanelMixin, SecurityMixin):
         self.ssh.write_json(REMOTE_ROOT + '/deployment.json', record)
         save_secret(self.record_name(), record)
         save_public('last-server', s.public_dict())
-        self.progress(100, '部署完成，等待节点连通性验证')
+        self.progress(94, '服务器配置完成，等待实际连接验证')
         return record
 
     def load_remote(self):
@@ -277,7 +277,7 @@ class Engine(MaintenanceMixin, BackupMixin, PublicPanelMixin, SecurityMixin):
         self.ssh.write_json(REMOTE_ROOT+'/rules.json',record['rules'])
         self.ssh.write(REMOTE_ROOT+'/firewall.py',scripts.FIREWALL_PY)
         if s.firewall:self.log(self.ssh.run('python3 '+REMOTE_ROOT+'/firewall.py'))
-        self.log('域名证书通过 TCP 80 验证；请确保 RakSmart 入站 TCP 80 已放行并保持开放以自动续期。')
+        self.log('域名证书通过 TCP 80 验证；本机规则启用时已配置此端口。若服务商外部防火墙阻拦，请到对应后台放行；续期需要保留规则。')
         name='certificate-http-'+hashlib.sha256(s.domain.encode()).hexdigest()[:20]
         base=REMOTE_ROOT+'/certs/'+s.domain
         if not (self.ssh.exists(base+'/fullchain.pem') and self.ssh.exists(base+'/key.pem')):
@@ -286,7 +286,7 @@ class Engine(MaintenanceMixin, BackupMixin, PublicPanelMixin, SecurityMixin):
         except ConnectionCancelled:
             raise
         except Exception as ex:
-            raise RuntimeError('域名证书申请未完成。请核对灰云 A 记录、RakSmart TCP 80 入站规则、服务器防火墙及 CAA 设置后重试。\n'+str(ex)) from ex
+            raise RuntimeError('域名证书申请未完成。请核对灰云 A 记录、TCP 80 监听与本机防火墙、外部网络及 CAA 设置；若服务商外部防火墙阻拦，再到对应后台放行。\n'+str(ex)) from ex
         self.ssh.run('openssl x509 -in '+shlex.quote(base+'/fullchain.pem')+' -checkend 86400 -checkhost '+shlex.quote(s.domain)+' -noout')
 
     def apply_certificate(self):

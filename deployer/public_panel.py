@@ -95,7 +95,7 @@ class PublicPanelMixin:
         self.ssh.write(REMOTE_ROOT+'/firewall.py',scripts.FIREWALL_PY)
         self.log(self.ssh.run('python3 '+REMOTE_ROOT+'/firewall.py'))
         self.persist(candidate)
-        self.log('公网面板入口已生成，请在云安全组放行管理面板 TCP '+str(candidate['ports']['panel']))
+        self.log('公网面板入口已生成，管理面板 TCP '+str(candidate['ports']['panel'])+'；实际外部连接仍需验证。')
         return candidate
 
     def configure_public_panel(self,payload):
@@ -147,7 +147,7 @@ class PublicPanelMixin:
             raise
         candidate['settings'].update(panel_port=port,panel_public=True,panel_domain=domain,management_cidr='0.0.0.0/0')
         self.persist(candidate)
-        self.log('服务器已配置公网 HTTPS 面板。请在服务商安全组放行 TCP '+str(port)+'，之后从其他电脑使用公网链接登录。')
+        self.log('服务器已配置公网 HTTPS 面板，TCP '+str(port)+'；随后验证公网入口，若服务商外部防火墙阻拦再到对应后台放行。')
         return candidate
 
     def disable_public_panel(self,payload):

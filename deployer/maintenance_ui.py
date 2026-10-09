@@ -111,10 +111,10 @@ class MaintenanceUi(SecurityUi):
             ('查看最近服务日志',lambda:self.start('service_logs')),('打开管理面板',lambda:self.start('open'))])
         section('面板账号与密码','修改这台服务器的 3x-ui 首个管理员账号与密码；SSH 登录信息单独保存。',[
             ('修改面板账号与密码',self.edit_panel_login)])
-        section('端口与网络','读取真实监听和防火墙规则；外部超时需进一步排查云安全组或网络。',[
+        section('端口与网络','先检查监听和本机规则，再验证实际连接；超时不能单独确定是安全组问题。',[
             ('读取监听与防火墙',lambda:self.start('overview')),('测试现有节点',lambda:self.start('test')),
             ('限量测速与重传诊断',lambda:self.confirm_action('network_diagnosis','将比较本机直连、VPS 直连和现有节点。每项最多 4 MiB，双协议共最多 16 MiB；不会调整网络参数。')),
-            ('同步面板端口与本机规则',lambda:self.start('sync')),('复制云安全组清单',self.copy_rules)])
+            ('同步面板端口与本机规则',lambda:self.start('sync')),('重新验证节点与面板',lambda:self.start('verify_connectivity')),('复制端口清单',self.copy_rules)])
         self.build_security(page)
         card=section('BBR 管理','TCP BBR 与 HY2 QUIC 分开显示。安装内核后需要重启，只有状态检查通过才标记生效。',[
             ('刷新当前 BBR 状态',lambda:self.start('current_bbr')),

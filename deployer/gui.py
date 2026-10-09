@@ -14,7 +14,7 @@ from .models import Settings, random_panel_password
 from .engine import Engine, ASSETS
 from .domain_certificate import check_domain
 from .ssh import ConnectionCancelled
-from .storage import save_public, load_public, load_secret, clear_saved_ssh_credentials, remember_server, saved_servers, server_id, save_server_limits, LIMIT_KEYS, migrate_saved_servers, load_login_password, forget_login_password
+from .storage import save_public, load_public, load_secret, save_secret, clear_saved_ssh_credentials, remember_server, saved_servers, server_id, save_server_limits, LIMIT_KEYS, migrate_saved_servers, load_login_password, forget_login_password
 from .maintenance_ui import MaintenanceUi, LimitsEditor
 from .maintenance import date_text
 from .public_panel import public_url
@@ -101,6 +101,8 @@ class Worker(QThread):
                 record = self.engine.load_remote()
                 actual=Settings(**record['settings']);actual.host=self.settings.host
                 result = test_nodes(actual,record,self.log.emit)
+            elif self.action == 'verify_connectivity':
+                result = self.engine.load_remote()
             elif self.action.startswith('restore:'):
                 result = self.engine.restore(self.action.split(':',1)[1])
             elif self.action in ('restart_core','restart_panel','reboot'):
@@ -109,6 +111,13 @@ class Worker(QThread):
                 result = getattr(self.engine, self.action)(self.payload)
             else:
                 result = getattr(self.engine, self.action)()
+            if self.action in ('deploy','resume_deploy','sync','apply_certificate','configure_public_panel','enable_automatic_panel','verify_connectivity') or (self.action=='open' and result.get('generated')):
+                from .connectivity import verify_connectivity
+                record = result['record'] if self.action=='open' else result
+                checkpoint(96, '服务器配置已完成，正在验证节点与公网面板')
+                record['connectivity'] = verify_connectivity(self.settings, record, self.engine.log, self.isInterruptionRequested)
+                save_secret(self.engine.record_name(), record)
+                checkpoint(100, '连接验证全部通过' if record['connectivity']['all_passed'] else '服务器配置已完成，部分连接需排查')
         except ConnectionCancelled as ex:
             self.cancelled.emit(str(ex))
             return
@@ -133,7 +142,7 @@ class HostIdentityDialog(QDialog):
             field=QLineEdit(value);field.setReadOnly(True);form.addRow(title,field)
         layout.addLayout(form)
         details=QFrame();details.setObjectName('card');area=QVBoxLayout(details);area.setContentsMargins(16,14,16,14)
-        area.addWidget(label('在 RakSmart 的这台服务器网页控制台（VNC / KVM）登录 root，然后执行：','subtitle'))
+        area.addWidget(label('在服务商提供的这台服务器网页控制台（VNC / KVM）登录 root，然后执行：','subtitle'))
         command=QLineEdit('for key in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$key" -E sha256; done');command.setReadOnly(True);area.addWidget(command)
         area.addWidget(label('输出会列出各类型公钥的 SHA256 指纹；找到与上方当前指纹完全相同的一条。此命令不修改系统。','subtitle'))
         details.hide()
@@ -291,6 +300,7 @@ class Window(MaintenanceUi, QMainWindow):
             self.show_record(self.record)
         else:
             self.summary.setText('还没有当前服务器的部署记录。');self.credentials.clear();self.public_link.clear();self.linkbox.clear();self.table.setRowCount(0)
+            self.connectivity_summary.setText('尚未验证；点击“重新验证节点与面板”。')
             self.result_user.clear();self.result_password.clear()
     def check(self,k,text,value=True):
         w=QCheckBox(text); w.setChecked(value); self.inputs[k]=w; return w
@@ -361,9 +371,10 @@ class Window(MaintenanceUi, QMainWindow):
         self.credentials=label('','subtitle');area.addWidget(self.credentials)
         self.linkbox=QPlainTextEdit(); self.linkbox.setReadOnly(True); self.linkbox.setMinimumHeight(160); area.addWidget(self.linkbox)
         row=QHBoxLayout(); row.addWidget(button('复制链接',lambda:QApplication.clipboard().setText(self.linkbox.toPlainText()))); row.addWidget(button('二维码',self.qr)); row.addWidget(button('导出链接',self.export)); area.addLayout(row); page.addWidget(frame)
-        frame,area=card('RakSmart 安全组','服务器本机规则会自动配置。云安全组请按下方实际端口放行；启用公网面板后也需放行面板 TCP 端口。')
+        frame,area=card('端口与连通性','勾选本机规则后通过 SSH 配置端口，再验证实际连接；已连通时无需额外设置安全组。')
+        self.connectivity_summary=label('尚未验证；点击“重新验证节点与面板”。','subtitle');area.addWidget(self.connectivity_summary)
         self.table=QTableWidget(0,4); self.table.setHorizontalHeaderLabels(['用途','端口','协议','来源']); self.table.horizontalHeader().setStretchLastSection(True); self.table.setMinimumHeight(160); area.addWidget(self.table)
-        row=QHBoxLayout(); row.addWidget(button('查看放行步骤',self.guide)); row.addWidget(button('复制端口清单',self.copy_rules)); area.addLayout(row); area.addWidget(button('同步面板现有端口',lambda:self.start('sync'))); page.addWidget(frame); page.addStretch()
+        row=QHBoxLayout(); row.addWidget(button('查看连接排查教程',self.guide)); row.addWidget(button('复制端口清单',self.copy_rules)); area.addLayout(row); area.addWidget(button('重新验证节点与面板',lambda:self.start('verify_connectivity')));area.addWidget(button('同步面板现有端口',lambda:self.start('sync'))); page.addWidget(frame); page.addStretch()
     def result_copy_field(self,form,title,key):
         from PySide6.QtWidgets import QToolButton
         field=QLineEdit();field.setReadOnly(True)
@@ -524,7 +535,7 @@ class Window(MaintenanceUi, QMainWindow):
         try:
             s=self.settings(False)
             if action=='deploy' and s.hy2 and self.certificate_confirmation!=self.certificate_selection():
-                QMessageBox.information(self,'请先设置 HY2 证书','你已勾选 HY2，请先选择证书方式，并点击“确认部署证书设置”。\n\n自签证书：无需域名。\n域名证书：只填域名，确保灰云解析指向 VPS，并在安全组放行 TCP 80。\n\n确认后再开始部署。')
+                QMessageBox.information(self,'请先设置 HY2 证书','你已勾选 HY2，请先选择证书方式，并点击“确认部署证书设置”。\n\n自签证书：无需域名。\n域名证书：只填域名，确保灰云解析指向 VPS，并确保 TCP 80 可从外部访问；本机规则启用时通过 SSH 配置。\n\n确认后再开始部署。')
                 self.focus_certificate();return
             if not s.host or not s.ssh_port:
                 self.nav.setCurrentIndex(0);self.server_card.setExpanded(True)
@@ -551,7 +562,7 @@ class Window(MaintenanceUi, QMainWindow):
             worker.result.connect(lambda r,a=action,w=worker:self.finished(a,r,w)); worker.failed.connect(self.failure)
             worker.cancelled.connect(self.connection_cancelled)
             worker.finished.connect(lambda w=worker:self.release_worker(w))
-            names={'deploy':'一键部署','inspect':'SSH 连接检查','cloudflare':'域名解析检查','open':'打开管理面板','test':'节点连通性测试','sync':'同步节点端口','diagnose':'服务器诊断','backup':'创建备份','restore_bbr':'恢复 BBR 参数','apply_certificate':'应用域名证书','verify_bbr':'验证 BBRv3 状态','reboot_bbr':'重启服务器'}
+            names={'deploy':'一键部署','inspect':'SSH 连接检查','cloudflare':'域名解析检查','open':'打开管理面板','test':'节点连通性测试','verify_connectivity':'验证节点与公网面板','sync':'同步节点端口','diagnose':'服务器诊断','backup':'创建备份','restore_bbr':'恢复 BBR 参数','apply_certificate':'应用域名证书','verify_bbr':'验证 BBRv3 状态','reboot_bbr':'重启服务器'}
             names.update({'overview':'刷新服务器状态','current_bbr':'查看当前 BBR','native_bbr':'启用内核 BBR','install_bbr':'安装 BBRv3','clients':'读取节点用户','change_client':'修改节点用户','service_logs':'读取服务日志','restart_core':'重启核心','restart_panel':'重启面板','reboot':'重启服务器','certificate_status':'查看证书','renew_certificate':'更新证书','backups':'读取备份列表','download_backup':'下载加密备份','import_backup':'恢复加密备份','cleanup_preview':'预览缓存','cleanup':'清理缓存','clean_old_logs':'清理旧日志'})
             names['change_panel_login']='修改面板账号密码'
             names.update(security_status='查看防爆破统计',security_apply='启用 SSH 防爆破',security_disable='停用 SSH 防爆破',security_unban='解除 SSH 封禁',security_restore='恢复防爆破规则',resume_deploy='继续未完成部署',network_diagnosis='限量测速与重传诊断')
@@ -584,7 +595,7 @@ class Window(MaintenanceUi, QMainWindow):
             self.maintenance_target.setText('目标服务器：'+self.target_text()+' · 最近连接 '+datetime.now().strftime('%H:%M'))
         if action.startswith('security_'):
             self.render_security(result)
-        elif action in ('deploy','resume_deploy','sync','apply_certificate','verify_bbr','install_bbr','renew_certificate','import_backup','change_panel_login','configure_public_panel','disable_public_panel','renew_public_panel_certificate') or action.startswith('restore:'):
+        elif action in ('deploy','resume_deploy','sync','apply_certificate','verify_bbr','install_bbr','renew_certificate','import_backup','change_panel_login','configure_public_panel','enable_automatic_panel','verify_connectivity','disable_public_panel','renew_public_panel_certificate') or action.startswith('restore:'):
             self.record=result; self.show_record(result); self.nav.setCurrentIndex(1)
             if action=='resume_deploy':
                 for key,value in result['ports'].items():self.inputs[key+'_port'].setValue(value)
@@ -594,12 +605,14 @@ class Window(MaintenanceUi, QMainWindow):
                 self.render_bbr_status(result['bbr_status'])
             if action=='change_panel_login':
                 self.inputs['panel_user'].setText(result['identity']['panel_user']);self.inputs['panel_password'].setText(result['identity']['panel_password'])
-            if action in ('deploy','sync','apply_certificate','configure_public_panel','enable_automatic_panel'):self.security_group_notice()
+            if action in ('deploy','resume_deploy','sync','apply_certificate','configure_public_panel','enable_automatic_panel','verify_connectivity'):
+                self.state.setText('连接验证全部通过' if result.get('connectivity',{}).get('all_passed') else '服务器配置已完成 · 部分连接需排查')
+                self.security_group_notice()
             if action=='import_backup' or action.startswith('restore:'):
                 checks=result.get('restore_test',{})
                 if any(v.get('status')=='未通过' for v in checks.values()):
                     self.state.setText('配置已恢复 · 节点测试未全部通过')
-                    QMessageBox.information(self,'请核对节点连接','配置与证书已恢复；部分节点未连通，请查看右侧日志并核对实际端口的云安全组规则。')
+                    QMessageBox.information(self,'请核对节点连接','配置与证书已恢复；部分节点未连通，请查看日志，检查服务、节点配置、本机防火墙及外部网络。')
             status=result.get('bbrv3',{})
             if action in ('deploy','verify_bbr','install_bbr') and status:
                 if status.get('active'):
@@ -624,7 +637,7 @@ class Window(MaintenanceUi, QMainWindow):
         elif action=='inspect':
             details=f"系统：{result['os'].splitlines()[0]}\n架构：{result['arch']}\n可用磁盘：{result['free_gb']} GB\nTCP 算法：{result['bbr']}\n已有面板：{'是' if result['panel_installed'] else '否'}"
             self.append_log(details);QMessageBox.information(self,'连接正常',details)
-        elif action=='cloudflare':QMessageBox.information(self,'域名解析检查通过',f"域名：{result['domain']}\n解析指向：{result['address']}\n与当前 VPS 匹配。\n证书签发还需云安全组和本机防火墙放行 TCP 80。")
+        elif action=='cloudflare':QMessageBox.information(self,'域名解析检查通过',f"域名：{result['domain']}\n解析指向：{result['address']}\n与当前 VPS 匹配。\n证书签发需要 TCP 80 可从外部访问；本机规则启用时通过 SSH 配置，若外部防火墙阻拦再到对应后台放行。")
         else:
             text=result if isinstance(result,str) else json.dumps(result,ensure_ascii=False,indent=2)
             self.append_log(text)
@@ -639,9 +652,11 @@ class Window(MaintenanceUi, QMainWindow):
         if r.get('bbrv3'):self.summary.setText(self.summary.text()+'\nbyJoey BBRv3：'+('已验证生效' if r['bbrv3'].get('active') else '尚未生效，请重启后验证'))
         self.linkbox.setPlainText('\n'.join(r.get('links',{}).values()))
         url=public_url(r);self.public_link.setText(url)
-        note=('此链接可在其他电脑登录，关闭软件也能访问；请放行面板 TCP 端口。'+(' IP 使用 HTTP，浏览器登录信息不加密；配置域名证书可使用 HTTPS。' if url.startswith('http://') else '')) if url else '点击“打开面板”自动生成可跨电脑访问的链接。'
+        note=('这是公网面板链接，关闭软件后仍可访问；实际连接结果见下方“端口与连通性”。'+(' IP 使用 HTTP，浏览器登录信息不加密；配置域名证书可使用 HTTPS。' if url.startswith('http://') else '')) if url else '点击“打开面板”自动生成可跨电脑访问的链接。'
         self.result_user.setText(r['identity']['panel_user']);self.result_password.setText(r['identity']['panel_password'])
         self.credentials.setText(note)
+        from .connectivity import summary
+        self.connectivity_summary.setText(summary(r.get('connectivity')))
         rules=r.get('rules',[]); self.table.setRowCount(len(rules))
         for i,rule in enumerate(rules):
             for j,key in enumerate(('service','port','protocol','source')):self.table.setItem(i,j,QTableWidgetItem(str(rule[key])))
@@ -649,17 +664,21 @@ class Window(MaintenanceUi, QMainWindow):
     def copy_rules(self):
         if self.record:QApplication.clipboard().setText('\n'.join(f"{r['service']}：{r['protocol']} {r['port']}，入站来源 {r['source']}" for r in self.record.get('rules',[])))
     def security_group_notice(self):
-        if not self.record:return
-        dialog=QDialog(self);dialog.setWindowTitle('下一步：放行 RakSmart 云安全组');dialog.resize(640,460)
+        if not self.record or self.record.get('connectivity',{}).get('all_passed'):return
+        dialog=QDialog(self);dialog.setWindowTitle('配置已完成，部分连接需排查');dialog.resize(680,560)
         layout=QVBoxLayout(dialog);layout.setContentsMargins(26,24,26,24);layout.setSpacing(16)
-        layout.addWidget(label('服务器已配置，请核对云安全组','section'))
-        layout.addWidget(label('服务器本机防火墙与 RakSmart 云安全组是两层。SSH 只能配置本机规则；云安全组需要在服务商后台保存并绑定到这台 VPS。','subtitle'))
+        layout.addWidget(label('服务器配置已保留，请检查实际连接','section'))
+        scroll=QScrollArea();scroll.setWidgetResizable(True);body=QWidget();content=QVBoxLayout(body)
+        from .connectivity import summary
+        content.addWidget(label(summary(self.record.get('connectivity')),'subtitle'))
+        content.addWidget(label('先检查服务是否运行、监听端口和本机防火墙，再检查域名解析与当前网络。只有服务商外部防火墙阻拦时，才需要在对应后台放行下方端口。超时本身不能确定是安全组问题。','subtitle'))
         rules='\n'.join(f"入站 {r['protocol']}  {r['port']}  ·  {r['service']}\n来源 {r['source']}，最小和最大端口都填 {r['port']}" for r in self.record.get('rules',[]))
-        layout.addWidget(label(rules))
+        content.addWidget(label(rules))
         ssh_port=self.record.get('settings',{}).get('ssh_port',self.settings(False).ssh_port)
-        note='公网面板还需放行上方管理面板 TCP 端口；Cloudflare 解析使用仅 DNS（灰云）。' if public_url(self.record) else '面板使用 SSH 隧道，不需要开放面板公网端口。'
-        layout.addWidget(label(f"保留 SSH TCP {ssh_port} 规则。\n"+note,'subtitle'))
-        layout.addWidget(label('完成后点击“测试两种节点”，通过测试后再导入 v2rayN。','subtitle'))
+        note='公网面板使用上方管理面板 TCP 端口；Cloudflare 解析使用仅 DNS（灰云）。' if public_url(self.record) else '面板使用 SSH 隧道，不需要开放面板公网端口。'
+        content.addWidget(label(f"保留 SSH TCP {ssh_port} 规则。\n"+note,'subtitle'))
+        content.addWidget(label('证书验证与续期 TCP 80 仅在验证时监听，空闲时不参与连接判断。排查后点击“重新验证节点与面板”。','subtitle'))
+        scroll.setWidget(body);layout.addWidget(scroll,1)
         row=QHBoxLayout();row.addWidget(button('复制放行清单',self.copy_rules));row.addWidget(button('打开详细教程',self.guide));layout.addLayout(row)
         layout.addWidget(button('我知道了，查看节点',dialog.accept,True));dialog.exec()
     def export(self):
@@ -737,6 +756,20 @@ def main():
                 scroll.horizontalScrollBar().setValue(0)
                 app.processEvents()
                 window.grab().save(str(Path(os.environ['NODEPILOT_SMOKE_TEST']).with_suffix('.security.png')))
+            if os.environ.get('NODEPILOT_SMOKE_CONNECTIVITY'):
+                window.record={'settings':{'host':'192.0.2.1','ssh_port':2222},
+                    'ports':{'panel':25000,'vless':25001,'hy2':25002},
+                    'identity':{'panel_user':'demo','panel_password':'demo-only','panel_path':'/demo/'},
+                    'panel_access':{'public':True,'scheme':'https','domain':'node.example.com'},
+                    'links':{},'rules':[],
+                    'connectivity':{'all_passed':True,'checked_at':'2026-10-09T12:00:00+08:00',
+                        'rows':[{'service':'VLESS','protocol':'TCP','port':25001,'state':'passed','detail':'实际 HTTPS 流量通过'},
+                                {'service':'HY2','protocol':'UDP','port':25002,'state':'passed','detail':'实际 HTTPS 流量通过'},
+                                {'service':'管理面板','protocol':'TCP','port':25000,'state':'passed','detail':'公网入口已响应（HTTP 200）'}]}}
+                window.show_record(window.record);window.nav.setCurrentIndex(1);window.security_group_notice()
+                scroll=window.stack.widget(1);scroll.ensureWidgetVisible(window.connectivity_summary,0,20)
+                app.processEvents()
+                window.grab().save(str(Path(os.environ['NODEPILOT_SMOKE_TEST']).with_suffix('.connectivity.png')))
             app.quit()
         QTimer.singleShot(300,smoke)
     app.exec()
