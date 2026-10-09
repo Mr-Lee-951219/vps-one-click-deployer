@@ -17,14 +17,17 @@ BEIJING = timezone(timedelta(hours=8))
 EVENT = re.compile(r'\[' + JAIL + r'\]\s+(Found|Ban|Unban)\s+(\S+)')
 
 
-def set_scope(scope):
+def set_scope(scope, jail=None):
     global ROOT, JAIL, EVENT, SCOPE, JAIL_FILE
     if scope not in ('ssh', 'panel'):
         raise ValueError('防护对象无效')
     SCOPE = scope
-    ROOT = Path('/var/lib/nodepilot/security' + ('/panel' if scope == 'panel' else ''))
-    JAIL = 'nodepilot-panel' if scope == 'panel' else 'nodepilot-sshd'
-    JAIL_FILE = '/etc/fail2ban/jail.d/' + JAIL + '.local'
+    jail = jail or ('nodepilot-panel' if scope == 'panel' else 'nodepilot-sshd')
+    if jail not in (('sshd', 'nodepilot-sshd') if scope == 'ssh' else ('nodepilot-panel',)):
+        raise ValueError('防护规则名称无效')
+    ROOT = Path('/var/lib/nodepilot/security' + ('/panel' if scope == 'panel' else ('/sshd' if jail == 'sshd' else '')))
+    JAIL = jail
+    JAIL_FILE = '/etc/fail2ban/jail.d/' + ('zzzz-nodepilot-sshd' if jail == 'sshd' else jail) + '.local'
     EVENT = re.compile(r'\[' + JAIL + r'\]\s+(Found|Ban|Unban)\s+(\S+)')
 
 
@@ -41,12 +44,15 @@ def parse_event(line, timestamp=None):
         return None
 
 
-def connect_db(root=ROOT):
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    db = sqlite3.connect(root / 'events.sqlite', timeout=20)
+def connect_db(root=ROOT, readonly=False):
+    if not readonly:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    db = sqlite3.connect(':memory:' if readonly else root / 'events.sqlite', timeout=20)
     db.execute('CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, ts REAL, ip TEXT, kind TEXT)')
     db.execute('CREATE INDEX IF NOT EXISTS events_time ON events(ts)')
     db.execute('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)')
+    if readonly:
+        put_meta(db, 'ephemeral', True)
     db.commit()
     return db
 
@@ -68,6 +74,13 @@ def collect_file(db, path):
         state = {'offset': 0, 'generation': state['generation'] + 1}
     consumed = 0
     with path.open('rb') as stream:
+        if get_meta(db, 'ephemeral', False) and state['offset'] == 0 and stat.st_size > 8 * 1024**2:
+            # Existing manual servers are read without a persisted cursor. Prefer recent
+            # records instead of repeatedly scanning only the oldest part of a large log.
+            stream.seek(stat.st_size - 8 * 1024**2)
+            stream.readline(65536)
+            state['offset'] = stream.tell()
+            put_meta(db, 'partial', True)
         stream.seek(state['offset'])
         while consumed < 8 * 1024**2:
             offset = stream.tell()
@@ -81,6 +94,8 @@ def collect_file(db, path):
                 db.execute('INSERT OR IGNORE INTO events VALUES (?,?,?,?)', (identity, event['ts'], event['ip'], event['kind']))
             state['offset'] = stream.tell()
     put_meta(db, key, state)
+    if state['offset'] < stat.st_size:
+        put_meta(db, 'partial', True)
 
 
 def command(args):
@@ -91,14 +106,25 @@ def command(args):
         return 1, ''
 
 
+def logging_path(output):
+    # The client normally wraps the value in "Current logging target is:\n`- ...".
+    for line in output.splitlines():
+        value = line.strip().removeprefix('`- ').removeprefix('|- ').strip()
+        if value.startswith('/') or Path(value).is_absolute():
+            return Path(value)
+    return None
+
+
 def collect(db, log=None):
     if log is None:
         code, target = command(['fail2ban-client','get','logtarget'])
-        log = Path(target) if code == 0 and Path(target).is_absolute() else Path('/var/log/fail2ban.log')
-        if code == 0 and not Path(target).is_absolute():
+        log = logging_path(target) if code == 0 else Path('/var/log/fail2ban.log')
+        if log is None:
             log = Path('/var/lib/nodepilot/security/no-file-log')
     db.execute('BEGIN IMMEDIATE')
     try:
+        put_meta(db, 'partial', False)
+        put_meta(db, 'log_available', True)
         if log.exists():
             # Read the rotated file before the current one. Persist each inode's offset.
             rotated = log.with_name(log.name + '.1')
@@ -113,9 +139,12 @@ def collect(db, log=None):
                 args += ['--after-cursor', cursor]
             # Stream up to a bounded number of records; do not silently jump to the tail.
             with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) as process:
+                records = 0
                 try:
                     for n, line in enumerate(process.stdout):
+                        records += 1
                         if n >= 50000:
+                            put_meta(db, 'partial', True)
                             break
                         try:
                             entry = json.loads(line)
@@ -133,6 +162,8 @@ def collect(db, log=None):
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         process.kill(); process.wait(timeout=5)
+                if (not records and not cursor) or process.returncode not in (0, -15):
+                    put_meta(db, 'log_available', False)
             source = 'systemd journal'
         now = time.time()
         db.execute('DELETE FROM events WHERE ts < ?', (now - 90 * 86400,))
@@ -144,6 +175,36 @@ def collect(db, log=None):
     except Exception:
         db.rollback()
         raise
+
+
+def status_counts(output):
+    """Parse named status fields; never infer counters from the number of log rows."""
+    result = {}
+    for field, key in [('Currently failed', 'currently_failed'), ('Total failed', 'total_failed'),
+                       ('Currently banned', 'currently_banned'), ('Total banned', 'total_banned')]:
+        match = re.search(r'\b' + field + r':\s*(\d+)\s*$', output, re.M)
+        result[key] = int(match[1]) if match else None
+    return result
+
+
+def choose_jail(scope, requested='auto'):
+    if scope == 'panel':
+        if requested not in ('auto', 'nodepilot-panel'):
+            raise ValueError('防护规则名称无效')
+        return 'nodepilot-panel', []
+    if requested not in ('auto', 'sshd', 'nodepilot-sshd'):
+        raise ValueError('防护规则名称无效')
+    _, output = command(['fail2ban-client', 'status'])
+    match = re.search(r'Jail list:\s*(.*)', output)
+    active = {name.strip() for name in match[1].split(',')} if match else set()
+    available = [name for name in ('sshd', 'nodepilot-sshd') if name in active]
+    if requested != 'auto':
+        return requested, available
+    if available:
+        return available[0], available
+    if Path('/etc/fail2ban/jail.d/nodepilot-sshd.local').exists():
+        return 'nodepilot-sshd', available
+    return 'sshd', available
 
 
 def summarize(db, days, active, now=None):
@@ -162,6 +223,8 @@ def summarize(db, days, active, now=None):
 
 
 def report(db, days):
+    status_code, status_output = command(['fail2ban-client', 'status', JAIL])
+    totals = status_counts(status_output) if status_code == 0 else {}
     code, output = command(['fail2ban-client', 'get', JAIL, 'banip'])
     active = set()
     if code == 0:
@@ -171,8 +234,8 @@ def report(db, days):
             except ValueError:
                 pass
     result = summarize(db, days, active)
-    state_error = code != 0 and Path(JAIL_FILE).exists()
-    if state_error:
+    state_error = (code != 0 and (status_code == 0 or Path(JAIL_FILE).exists())) or (status_code != 0 and code == 0)
+    if code != 0:
         result['metrics']['currently_banned'] = None
         for row in result['rows']:
             row['banned'] = None
@@ -180,9 +243,26 @@ def report(db, days):
     _, service = command(['systemctl', 'is-active', 'fail2ban'])
     _, collector = command(['systemctl', 'is-active', 'nodepilot-security-stats.timer'])
     policy = json.loads((ROOT / 'policy.json').read_text()) if (ROOT / 'policy.json').exists() else {}
-    result.update(scope=SCOPE, enabled=code == 0, installed=True, state_error=state_error, service=service, collector=collector, policy=policy,
+    managed = bool(policy)
+    log_available = get_meta(db, 'log_available', True)
+    if not log_available:
+        for key in ('failed_ips', 'failures', 'bans'):
+            result['metrics'][key] = None
+    partial = get_meta(db, 'partial', False)
+    result.update(scope=SCOPE, jail=JAIL, enabled=code == 0 and status_code == 0, installed=bool(managed or status_code == 0), managed=managed,
+                  active_ips=sorted(active) if code == 0 else None,
+                  state_error=state_error, service=service, collector=collector if managed else '未安装（刷新时读取已有日志）', policy=policy,
+                  totals=totals, status_output=status_output if status_code == 0 else '', log_available=log_available, partial=partial,
                   ban_times=ban_times, updated=get_meta(db, 'updated'), started=get_meta(db, 'started'),
-                  source=get_meta(db, 'source'), note='统计 ' + ('3x-ui 面板' if SCOPE == 'panel' else 'SSH') + ' 登录失败日志；失败不一定是恶意爆破。历史保留 90 天，IP 去重；明细最多 200 行。')
+                  source=get_meta(db, 'source'), note='按天统计来自可读取的 ' + JAIL + ' 失败与封禁日志；已删除的日志无法补回。累计计数来自 Fail2ban status，可能随服务或规则重启重置，与按天统计分别显示。明细最多 200 行。')
+    if not managed:
+        result['note'] += ' 当前仅兼容读取已有规则与日志，未安装采集服务或修改防护配置。'
+    if not log_available:
+        result['note'] += ' 历史日志读取失败，按天统计未确认；请参考累计计数和当前封禁列表。'
+    if partial:
+        result['note'] += ' 日志超过单次读取上限，本次按天统计不完整。'
+    if not result['enabled'] and not state_error:
+        result['note'] += ' 此规则未运行或 Fail2ban 不可用；有历史记录也不代表当前在防护。'
     if state_error:
         result['note'] += ' 防护规则已配置，但 Fail2ban 状态读取失败，请检查服务日志；当前封禁数量未知。'
     return result
@@ -193,21 +273,32 @@ def main():
     parser.add_argument('--collect', action='store_true')
     parser.add_argument('--days', type=int, choices=(1, 7, 30, 90), default=1)
     parser.add_argument('--scope', choices=('ssh', 'panel'), default='ssh')
+    parser.add_argument('--jail', choices=('auto', 'sshd', 'nodepilot-sshd', 'nodepilot-panel'), default='auto')
     parser.add_argument('--all', action='store_true')
     args = parser.parse_args()
     if args.all and not args.collect:
         parser.error('--all is only used for collection')
-    scopes = ('ssh', 'panel') if args.all else (args.scope,)
+    scopes = (('ssh', 'nodepilot-sshd'), ('ssh', 'sshd'), ('panel', 'nodepilot-panel')) if args.all else ((args.scope, args.jail),)
     errors = []
-    for scope in scopes:
-        set_scope(scope)
+    for scope, requested in scopes:
+        jail, available = (requested, []) if args.all else choose_jail(scope, requested)
+        set_scope(scope, jail)
         if args.all and not (ROOT / 'policy.json').exists():
             continue
-        db = connect_db(ROOT)
+        readonly = not (ROOT / 'policy.json').exists()
+        db = connect_db(ROOT, readonly=readonly)
         try:
-            collect(db)
+            try:
+                collect(db)
+            except (OSError, sqlite3.Error, subprocess.SubprocessError) as ex:
+                if args.collect:
+                    raise
+                put_meta(db, 'log_available', False)
+                put_meta(db, 'log_error', str(ex))
             if not args.collect:
-                print(json.dumps(report(db, args.days), ensure_ascii=False))
+                result = report(db, args.days)
+                result['available_jails'] = available
+                print(json.dumps(result, ensure_ascii=False))
         except Exception as ex:
             errors.append(scope + ': ' + str(ex))
         finally:

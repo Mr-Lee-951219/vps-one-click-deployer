@@ -55,7 +55,7 @@ class PanelSSH(FakeSSH):
         if command.startswith('mv -f -- '):
             self.files.pop(command.split()[3], None)
             return ''
-        if command.startswith('python3 ' + ROOT + '/collector.py'):
+        if command.startswith('python3 - --days'):
             jail = PANEL_JAIL if '--scope panel' in command else JAIL
             return json.dumps({'enabled': jail in self.running_jails, 'installed': True,
                                'rows': [], 'metrics': {'currently_banned': 0}})
@@ -186,8 +186,8 @@ def test_filter_matches_real_warning_formats_ipv6_and_rejects_username_ip_inject
 def test_statistics_use_separate_databases_and_do_not_double_count(tmp_path, monkeypatch):
     collector = load_asset('security-collector')
     log = tmp_path / 'fail2ban.log'
-    log.write_text(line() + line('Ban') + line(ip='198.51.100.3').replace(JAIL, PANEL_JAIL)
-                   + line('Ban', '198.51.100.3').replace(JAIL, PANEL_JAIL))
+    log.write_text(line() + line('Ban') + line(ip='198.51.100.3').replace('nodepilot-sshd', PANEL_JAIL)
+                   + line('Ban', '198.51.100.3').replace('nodepilot-sshd', PANEL_JAIL))
     results = []
     for scope in ('ssh', 'panel'):
         collector.set_scope(scope)
@@ -212,9 +212,9 @@ def test_all_collection_continues_with_other_scope_if_one_fails(tmp_path, monkey
     for scope in ('ssh', 'panel'):
         (tmp_path / scope).mkdir()
         (tmp_path / scope / 'policy.json').write_text('{}')
-    def set_scope(scope):
-        original(scope)
-        collector.ROOT = tmp_path / scope
+    def set_scope(scope, jail=None):
+        original(scope, jail)
+        collector.ROOT = tmp_path / (scope if jail != 'sshd' else 'standard-ssh')
     called = []
     def collect(db):
         called.append(collector.SCOPE)

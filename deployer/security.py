@@ -9,9 +9,11 @@ PANEL_JAIL = 'nodepilot-panel'
 PANEL_ROOT = '/var/lib/nodepilot/security/panel'
 PANEL_FILE = '/etc/fail2ban/jail.d/nodepilot-panel.local'
 PANEL_FILTER = '/etc/fail2ban/filter.d/nodepilot-panel.conf'
-JAIL = 'nodepilot-sshd'
+JAIL = 'sshd'
+LEGACY_JAIL = 'nodepilot-sshd'
 ROOT = '/var/lib/nodepilot/security'
-JAIL_FILE = '/etc/fail2ban/jail.d/nodepilot-sshd.local'
+JAIL_FILE = '/etc/fail2ban/jail.d/zzzz-nodepilot-sshd.local'
+LEGACY_FILE = '/etc/fail2ban/jail.d/nodepilot-sshd.local'
 JOURNAL_FILE = '/etc/fail2ban/jail.d/zz-nodepilot-journal.local'
 JOURNAL_CONFIG = '# NodePilot: Debian stock sshd jail on a journald-only host.\n[sshd]\nbackend = systemd\n'
 READY_CHECK = 'command -v fail2ban-client >/dev/null && command -v nft >/dev/null && python3 -c "import systemd.journal" >/dev/null 2>&1 && echo ready || true'
@@ -43,11 +45,14 @@ def validate_policy(payload):
     return result
 
 
-def jail_config(policy, port, peer='', scope='ssh', logpath=''):
+def jail_config(policy, port, peer='', scope='ssh', logpath='', jail=None):
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError('防护端口无效')
     if scope not in ('ssh', 'panel'):
         raise ValueError('防护对象无效')
+    jail = jail or (JAIL if scope == 'ssh' else PANEL_JAIL)
+    if jail not in ((JAIL, LEGACY_JAIL) if scope == 'ssh' else (PANEL_JAIL,)):
+        raise ValueError('防护规则名称无效')
     if scope == 'panel' and (not re.fullmatch(r'/[A-Za-z0-9_./-]+', logpath) or '..' in logpath.split('/')):
         raise ValueError('面板日志路径无效')
     policy = validate_policy(policy)
@@ -55,12 +60,13 @@ def jail_config(policy, port, peer='', scope='ssh', logpath=''):
     if peer:
         ignore.append(str(ipaddress.ip_address(peer)))
     source = (['filter = sshd', 'backend = systemd',
+               'action = nftables-multiport[name=' + jail + ', port="' + str(port) + '", protocol=tcp]',
                'journalmatch = _SYSTEMD_UNIT=ssh.service + _SYSTEMD_UNIT=sshd.service + _COMM=sshd']
               if scope == 'ssh' else ['filter = nodepilot-panel', 'backend = polling', 'logpath = ' + logpath,
                                      'action = nftables-multiport[name=nodepilot-panel, port="' + str(port) + '", protocol=tcp]'])
     return '\n'.join([
         '# Managed by NodePilot; other jails are left untouched.',
-        '[' + (JAIL if scope == 'ssh' else PANEL_JAIL) + ']', 'enabled = true', *source,
+        '[' + jail + ']', 'enabled = true', *source,
         'port = ' + str(port), 'protocol = tcp', 'usedns = no',
         'banaction = nftables-multiport', 'ignoreip = ' + ' '.join(dict.fromkeys(ignore)),
         'maxretry = ' + str(policy['maxretry']), 'findtime = ' + str(policy['findtime']),
@@ -100,25 +106,39 @@ class SecurityMixin:
         scope = (payload or {}).get('scope', 'ssh')
         if scope not in ('ssh', 'panel'):
             raise ValueError('防护对象无效')
-        return {'scope': scope, 'jail': JAIL if scope == 'ssh' else PANEL_JAIL,
-                'root': ROOT if scope == 'ssh' else PANEL_ROOT,
-                'file': JAIL_FILE if scope == 'ssh' else PANEL_FILE,
+        jail = (payload or {}).get('jail', 'auto')
+        if jail not in (('auto', JAIL, LEGACY_JAIL) if scope == 'ssh' else ('auto', PANEL_JAIL)):
+            raise ValueError('防护规则名称无效')
+        jail = PANEL_JAIL if scope == 'panel' else (JAIL if jail == 'auto' else jail)
+        return {'scope': scope, 'jail': jail,
+                'root': PANEL_ROOT if scope == 'panel' else (ROOT if jail == LEGACY_JAIL else ROOT + '/sshd'),
+                'file': PANEL_FILE if scope == 'panel' else (LEGACY_FILE if jail == LEGACY_JAIL else JAIL_FILE),
                 'label': 'SSH' if scope == 'ssh' else '3x-ui 面板'}
+
+    def resolve_security_context(self, payload=None):
+        ctx = self.security_context(payload)
+        if ctx['scope'] == 'ssh' and (payload or {}).get('jail', 'auto') == 'auto':
+            output = self.ssh.run('fail2ban-client status', check=False)
+            match = re.search(r'Jail list:\s*(.*)', output)
+            active = {x.strip() for x in match[1].split(',')} if match else set()
+            jail = JAIL if JAIL in active else (LEGACY_JAIL if LEGACY_JAIL in active or self.ssh.exists(LEGACY_FILE) else JAIL)
+            ctx = self.security_context({**(payload or {}), 'jail': jail})
+        return ctx
 
     def security_command(self, days, payload=None):
         if days not in (1, 7, 30, 90):
             raise ValueError('统计范围无效')
         ctx = self.security_context(payload)
-        return 'python3 ' + ROOT + '/collector.py --days ' + str(days) + (' --scope panel' if ctx['scope'] == 'panel' else '')
+        jail = (payload or {}).get('jail', 'auto') if ctx['scope'] == 'ssh' else PANEL_JAIL
+        source = (self.assets / 'security-collector.py').read_text(encoding='utf-8')
+        # Run the bundled reader in memory so even servers with no NodePilot installation work.
+        return "python3 - --days " + str(days) + ' --scope ' + ctx['scope'] + ' --jail ' + jail + " <<'NP_SECURITY'\n" + source + '\nNP_SECURITY'
 
     def security_status(self, payload=None):
         ctx = self.security_context(payload)
         self.ssh.connect()
         days = (payload or {}).get('days', 1)
         command = self.security_command(days, payload)
-        if not self.ssh.exists(ROOT + '/collector.py') or (ctx['scope'] == 'panel' and not self.ssh.exists(ctx['root'] + '/policy.json')):
-            return {'scope': ctx['scope'], 'enabled': False, 'installed': False, 'days': days, 'rows': [], 'metrics': {},
-                    'note': '尚未通过本软件启用 ' + ctx['label'] + ' 防爆破；启用后开始记录，历史最多保留 90 天。'}
         result = json.loads(self.ssh.run(command, timeout=90))
         result['scope'] = ctx['scope']
         if ctx['scope'] == 'panel' and result.get('enabled'):
@@ -131,9 +151,12 @@ class SecurityMixin:
             except Exception as ex:
                 result['target_error'] = str(ex)
                 result['note'] = result.get('note', '') + '\n' + str(ex)
-        current = result['metrics']['currently_banned']
+        current = result.get('metrics', {}).get('currently_banned')
         state = '规则需检查或更新' if result.get('target_error') else ('已启用' if result['enabled'] else '未启用或状态不可用')
-        self.log(ctx['label'] + ' 防爆破：' + state + '；当前封禁 ' + (str(current)+' 个 IP' if current is not None else '读取失败'))
+        self.log(ctx['label'] + ' 防爆破 [' + result.get('jail', ctx['jail']) + ']：' + state + '；当前封禁 ' + (str(current)+' 个 IP' if current is not None else '读取失败'))
+        totals = result.get('totals', {})
+        if totals:
+            self.log('Fail2ban 累计失败次数：' + str(totals.get('total_failed', '未确认')) + '；累计封禁次数：' + str(totals.get('total_banned', '未确认')) + '（与 status 命令同口径，不是按天统计）')
         return result
 
     def panel_security_target(self):
@@ -148,10 +171,11 @@ class SecurityMixin:
     def security_apply(self, payload):
         if payload.get('endpoint') != self.settings.host + ':' + str(self.settings.ssh_port):
             raise ValueError('目标服务器变化，请重新设置防爆破规则')
-        ctx = self.security_context(payload)
-        root, jail, jail_file, label = ctx['root'], ctx['jail'], ctx['file'], ctx['label']
         policy = validate_policy(payload)
+        self.security_context(payload)
         self.ssh.connect()
+        ctx = self.resolve_security_context(payload)
+        root, jail, jail_file, label = ctx['root'], ctx['jail'], ctx['file'], ctx['label']
         self.ssh.run('install -d -m 700 /var/lib/nodepilot ' + ROOT + ' ' + root)
         self.ssh.lock()
         # The actual connected source is allowlisted before the jail becomes active.
@@ -160,7 +184,7 @@ class SecurityMixin:
             raise RuntimeError('无法确认当前管理连接的来源 IP，未启用封禁规则')
         peer = str(ipaddress.ip_address(peer[0]))
         target = self.panel_security_target() if ctx['scope'] == 'panel' else {'port': self.settings.ssh_port}
-        config = jail_config(policy, target['port'], peer, ctx['scope'], target.get('logpath', ''))
+        config = jail_config(policy, target['port'], peer, ctx['scope'], target.get('logpath', ''), jail)
         self.ssh.run('test "$(id -u)" = 0 && . /etc/os-release && test "$ID" = debian && test "$VERSION_ID" = 12')
         if self.ssh.run(READY_CHECK).strip() != 'ready':
             self.ssh.run('rm -f -- /var/lib/nodepilot/jobs/security-dependencies.status')
@@ -173,6 +197,7 @@ class SecurityMixin:
         else:
             self.log('SSH 防护组件已就绪，跳过软件源刷新与重复安装。')
         old = self.ssh.read(jail_file) if self.ssh.exists(jail_file) else None
+        was_running = self.ssh.run('fail2ban-client status ' + jail + ' >/dev/null 2>&1 && echo active || true').strip() == 'active'
         old_filter = self.ssh.read(PANEL_FILTER) if ctx['scope'] == 'panel' and self.ssh.exists(PANEL_FILTER) else None
         old_journal = self.ssh.read(JOURNAL_FILE) if self.ssh.exists(JOURNAL_FILE) else None
         journal_changed = False
@@ -202,8 +227,8 @@ class SecurityMixin:
             self.ssh.run(WAIT_READY, timeout=45)
             self.ssh.run('fail2ban-client reload ' + jail, timeout=90)
             self.ssh.run('fail2ban-client status ' + jail)
-            if ctx['scope'] == 'panel' and 'nftables' not in self.ssh.run('fail2ban-client get ' + jail + ' actions'):
-                raise RuntimeError('面板规则未加载实际防火墙封禁动作，未确认生效')
+            if 'nftables' not in self.ssh.run('fail2ban-client get ' + jail + ' actions'):
+                raise RuntimeError(label + ' 规则未加载实际防火墙封禁动作，未确认生效')
         except Exception as ex:
             self.log('防爆破启用失败，具体原因：' + str(ex))
             try:
@@ -225,7 +250,7 @@ class SecurityMixin:
                     rollback_errors.append(path + '：' + str(rollback_error))
             try:
                 if self.ssh.run('fail2ban-client ping >/dev/null 2>&1 && echo ready || true').strip() == 'ready':
-                    if old is None:
+                    if old is None and not was_running:
                         active = self.ssh.run('fail2ban-client status '+jail+' >/dev/null 2>&1 && echo active || true').strip()
                         if active:
                             self.ssh.run('fail2ban-client stop ' + jail)
@@ -240,7 +265,7 @@ class SecurityMixin:
             raise RuntimeError('防爆破启用失败：\n' + str(ex)[-1800:] + '\n\n' + rollback + '\n详细诊断已显示在右侧日志。') from ex
         if old_policy is not None:
             self.ssh.write_json(root + '/previous-policy.json', old_policy)
-        policy.update(port=target['port'], management_ip=peer, scope=ctx['scope'])
+        policy.update(port=target['port'], management_ip=peer, scope=ctx['scope'], jail=jail)
         if ctx['scope'] == 'panel':
             policy['logpath'] = target['logpath']
         self.ssh.write_json(root + '/policy.json', policy)
@@ -249,16 +274,16 @@ class SecurityMixin:
         except Exception as ex:
             raise RuntimeError(label + ' 防护规则已启用，但统计定时任务未能启动。请刷新防护状态并检查 nodepilot-security-stats 服务日志；不要重复部署节点。') from ex
         self.log(label + ' 防爆破已启用，仅保护 TCP ' + str(target['port']) + '；当前管理来源 ' + peer + ' 已加入白名单。')
-        return self.security_status({'scope': ctx['scope'], 'days': payload.get('days', 1)})
+        return self.security_status({'scope': ctx['scope'], 'jail': jail, 'days': payload.get('days', 1)})
 
     def security_disable(self, payload=None):
         if (payload or {}).get('endpoint') != self.settings.host + ':' + str(self.settings.ssh_port):
             raise ValueError('目标服务器变化，请重新选择防护规则')
-        ctx = self.security_context(payload)
         self.ssh.connect()
-        if not self.ssh.exists(ctx['file']):
+        ctx = self.resolve_security_context(payload)
+        if not self.ssh.exists(ctx['file']) and ctx['jail'] != JAIL:
             return self.security_status(payload)
-        self.ssh.run('install -d -m 700 /var/lib/nodepilot ' + ROOT)
+        self.ssh.run('install -d -m 700 /var/lib/nodepilot ' + ROOT + ' ' + ctx['root'])
         self.ssh.lock()
         running = self.ssh.run('fail2ban-client status '+ctx['jail']+' >/dev/null 2>&1 && echo active || true').strip()
         if running:
@@ -267,27 +292,42 @@ class SecurityMixin:
                 raise RuntimeError(ctx['label'] + ' 防护仍在运行，未删除规则；请检查 Fail2ban 日志')
         elif not self.ssh.run('systemctl is-active fail2ban || true').strip() == 'active':
             raise RuntimeError('Fail2ban 服务不可用，无法确认封禁已解除；请通过服务商控制台检查')
-        self.ssh.run('mv -f -- ' + ctx['file'] + ' ' + ctx['root'] + '/disabled-jail.conf')
-        self.log('已停用本软件的 ' + ctx['label'] + ' 防爆破；其他防护规则与历史统计保持。')
-        return self.security_status(payload)
+        if ctx['jail'] == JAIL:
+            # A late override disables sshd persistently without deleting any user's files.
+            previous = self.ssh.read(ctx['file']) if self.ssh.exists(ctx['file']) else None
+            try:
+                self.ssh.write(ctx['file'], '# Managed by NodePilot\n[sshd]\nenabled = false\n')
+                self.ssh.run('fail2ban-client -t', timeout=90)
+            except Exception:
+                if previous is None:self.ssh.run('rm -f -- ' + ctx['file'])
+                else:self.ssh.write(ctx['file'], previous)
+                self.ssh.run('fail2ban-client reload ' + ctx['jail'], check=False)
+                raise
+            if previous is not None:self.ssh.write(ctx['root'] + '/disabled-jail.conf', previous)
+        else:
+            self.ssh.run('mv -f -- ' + ctx['file'] + ' ' + ctx['root'] + '/disabled-jail.conf')
+        self.log('已停用 ' + ctx['label'] + ' 防爆破 [' + ctx['jail'] + ']；其他防护规则与历史统计保持。')
+        return self.security_status({**(payload or {}), 'jail': ctx['jail']})
 
     def security_restore(self, payload):
-        ctx = self.security_context(payload)
         self.ssh.connect()
+        ctx = self.resolve_security_context(payload)
         previous = self.ssh.json(ctx['root'] + '/previous-policy.json', None)
         if not previous:
             raise ValueError('没有上一次防爆破配置可恢复')
-        return self.security_apply({**previous, 'scope': ctx['scope'], 'endpoint': payload['endpoint'], 'days': payload.get('days', 1)})
+        return self.security_apply({**previous, 'scope': ctx['scope'], 'jail': ctx['jail'], 'endpoint': payload['endpoint'], 'days': payload.get('days', 1)})
 
     def security_unban(self, payload):
         if payload.get('endpoint') != self.settings.host + ':' + str(self.settings.ssh_port):
             raise ValueError('目标服务器变化，请重新选择封禁 IP')
         ctx = self.security_context(payload)
+        if ctx['scope'] == 'ssh' and payload.get('jail', 'auto') == 'auto':
+            raise ValueError('请先刷新统计，再选择具体防护规则解封')
         ip = str(ipaddress.ip_address(payload.get('ip', '')))
         self.ssh.connect()
         self.ssh.run('fail2ban-client set ' + ctx['jail'] + ' unbanip ' + shlex.quote(ip))
         result = self.security_status(payload)
-        if result.get('state_error') or any(row['ip']==ip and row['banned'] for row in result['rows']):
+        if not result.get('enabled') or result.get('state_error') or result.get('metrics', {}).get('currently_banned') is None or ip in result.get('active_ips', []) or any(row['ip']==ip and row['banned'] for row in result['rows']):
             raise RuntimeError('无法确认此 IP 已解封，请刷新防护统计后检查')
         self.log('已回读确认解除 ' + ctx['label'] + ' 封禁：' + ip)
         return result

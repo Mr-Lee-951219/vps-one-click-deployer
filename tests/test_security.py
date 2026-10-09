@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import pytest
 from deployer.security import SecurityMixin, validate_policy, jail_config, ROOT, JAIL_FILE, JAIL, JOURNAL_FILE, WAIT_READY
+SSH_ROOT = ROOT + '/sshd'
 
 spec=importlib.util.spec_from_file_location('collector',Path('assets/security-collector.py'))
 collector=importlib.util.module_from_spec(spec);spec.loader.exec_module(collector)
@@ -96,6 +97,7 @@ class FakeSSH:
         self.commands.append(command)
         if '$SSH_CONNECTION' in command:return '203.0.113.9 54000 192.0.2.1 54887'
         if command.startswith('command -v'):return 'ready'
+        if command.startswith('fail2ban-client get ') and command.endswith(' actions'):return 'nftables-multiport'
         if command.startswith('fail2ban-client reload'):
             if self.fail_reload:raise RuntimeError('reload error')
             self.running=True
@@ -104,10 +106,11 @@ class FakeSSH:
             if self.fail_stop:raise RuntimeError('stop error')
             self.running=False
         if command.startswith('fail2ban-client status') and 'echo active' in command:return 'active' if self.running else ''
+        if command == 'fail2ban-client status':return 'Status\n Jail list: '+JAIL if self.running else 'Status\n Jail list:'
         if command.startswith('systemctl is-active'):return 'active'
         if command.startswith('mv -f'):self.files.pop(JAIL_FILE,None)
         if command.startswith('rm -f -- '):self.files.pop(command[len('rm -f -- '):],None)
-        if command.startswith('python3 '+ROOT):return json.dumps(dict(enabled=self.running,installed=True,rows=[dict(ip=ip,banned=True) for ip in self.active_ips],metrics={'currently_banned':len(self.active_ips)}))
+        if command.startswith('python3 - --days'):return json.dumps(dict(jail=JAIL,enabled=self.running,installed=True,rows=[dict(ip=ip,banned=True) for ip in self.active_ips],metrics={'currently_banned':len(self.active_ips)}))
         return ''
 
 
@@ -125,7 +128,7 @@ def test_failed_enable_restores_prior_jail_without_replacing_host_firewall():
     with pytest.raises(RuntimeError,match='reload error'):m.security_apply(payload())
     assert m.ssh.files[JAIL_FILE]==b'previous jail'
     assert not any('flush' in text or 'sshd_config' in text or 'nft -f' in text for text in m.ssh.commands)
-    assert ROOT+'/policy.json' not in m.ssh.files
+    assert SSH_ROOT+'/policy.json' not in m.ssh.files
 
 
 def test_journald_only_debian_retries_configuration_and_waits_for_socket():
@@ -168,17 +171,17 @@ def test_start_failure_restores_compatibility_file_and_keeps_diagnostics():
     with pytest.raises(RuntimeError,match='socket did not become ready'):m.security_apply(payload())
     assert JOURNAL_FILE not in m.ssh.files and JAIL_FILE not in m.ssh.files
     assert any('Fail2ban 诊断' in log for log in logs)
-    assert ROOT+'/policy.json' not in m.ssh.files
+    assert SSH_ROOT+'/policy.json' not in m.ssh.files
 
 
 def test_enable_keeps_rollback_policy_and_checks_endpoint_before_mutation():
     m=Manager();bad=payload();bad['endpoint']='192.0.2.2:54887'
     with pytest.raises(ValueError):m.security_apply(bad)
     assert not m.ssh.commands
-    m.ssh.files[ROOT+'/policy.json']=policy()
+    m.ssh.files[SSH_ROOT+'/policy.json']=policy()
     assert m.security_apply(payload())['enabled']
-    assert m.ssh.files[ROOT+'/policy.json']['management_ip']=='203.0.113.9'
-    assert ROOT+'/previous-policy.json' in m.ssh.files
+    assert m.ssh.files[SSH_ROOT+'/policy.json']['management_ip']=='203.0.113.9'
+    assert SSH_ROOT+'/previous-policy.json' in m.ssh.files
     assert '54887' in m.ssh.files[JAIL_FILE]
 
 
@@ -187,10 +190,10 @@ def test_disable_and_unban_do_not_claim_success_when_readback_fails():
     with pytest.raises(RuntimeError):m.security_disable(payload())
     assert JAIL_FILE in m.ssh.files
     m.ssh.fail_stop=False;m.security_disable(payload())
-    assert JAIL_FILE not in m.ssh.files and not m.ssh.running
+    assert 'enabled = false' in m.ssh.files[JAIL_FILE] and not m.ssh.running
     m.ssh.files[ROOT+'/collector.py']='collector';m.ssh.active_ips=['198.51.100.2']
-    with pytest.raises(RuntimeError,match='无法确认'):m.security_unban({**payload(),'ip':'198.51.100.2'})
-    with pytest.raises(ValueError):m.security_unban({**payload(),'ip':'198.51.100.2; reboot'})
+    with pytest.raises(RuntimeError,match='无法确认'):m.security_unban({**payload(),'jail':JAIL,'ip':'198.51.100.2'})
+    with pytest.raises(ValueError):m.security_unban({**payload(),'jail':JAIL,'ip':'198.51.100.2; reboot'})
 
 
 def test_ui_statistics_are_nested_in_protection_card_and_https_uses_existing_entry(tmp_path,monkeypatch):

@@ -280,6 +280,7 @@ class Window(MaintenanceUi, QMainWindow):
             self.bbr_summary.setText('尚未读取当前 BBR 状态')
             self.security_data={};self.security_rows=[];self.security_table.setRowCount(0)
             self.security_summary.setText('尚未读取当前服务器的防护状态');self.security_metrics.setText('请刷新当前服务器的统计');self.security_times.setText('封禁与解封时间：刷新后显示')
+            self.security_totals.setText('Fail2ban 累计计数：刷新后显示')
         self.maintenance_target.setText('目标服务器：'+(self.target_text() if host and port else '尚未选择'))
         self.load_saved_login()
         self.record=load_secret(host.replace(':','_')+'_'+str(port)) if host and port else None
@@ -721,6 +722,21 @@ def main():
                 dialog.ended(0,'脚本已退出')
                 assert not dialog.input.isEnabled()
                 dialog.reject()
+            if os.environ.get('NODEPILOT_SMOKE_SECURITY'):
+                window.nav.setCurrentIndex(2);window.security_card.setExpanded(True)
+                window.render_security({'scope':'ssh','jail':'sshd','enabled':True,'installed':True,'managed':False,
+                    'totals':{'total_failed':91,'total_banned':17,'currently_failed':15},
+                    'metrics':{'failed_ips':3,'failures':31,'bans':4,'currently_banned':2},
+                    'rows':[{'ip':'198.51.100.2','failures':12,'bans':2,'last':0,'banned':True},
+                            {'ip':'2001:db8::7','failures':19,'bans':2,'last':0,'banned':True}],
+                    'policy':{},'collector':'未安装（刷新时读取已有日志）',
+                    'note':'已识别手动 sshd；累计计数与 FinalShell 的 status 命令一致。'})
+                assert '91' in window.security_totals.text() and window.security_action_payload()['jail']=='sshd'
+                app.processEvents()
+                scroll=window.stack.widget(2);scroll.ensureWidgetVisible(window.security_totals,0,150)
+                scroll.horizontalScrollBar().setValue(0)
+                app.processEvents()
+                window.grab().save(str(Path(os.environ['NODEPILOT_SMOKE_TEST']).with_suffix('.security.png')))
             app.quit()
         QTimer.singleShot(300,smoke)
     app.exec()
