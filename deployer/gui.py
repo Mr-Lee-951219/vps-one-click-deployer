@@ -516,6 +516,8 @@ class Window(MaintenanceUi, QMainWindow):
         if validate:s.validate()
         return s
     def start(self,action,payload=None):
+        if getattr(self,'bbr_dialog',None) is not None:
+            return  # Pause maintenance timers while the modal owns its SSH operation.
         if self.active and self.active.isRunning():
             QMessageBox.information(self,'任务进行中','请等待当前任务结束。'); return
         try:
@@ -678,6 +680,8 @@ class Window(MaintenanceUi, QMainWindow):
             QMessageBox.information(self,'任务进行中','请等待当前任务结束。');return
         self.confirm_action('reboot_bbr','重启会短暂中断 SSH、管理面板和节点。重启后请刷新当前 BBR 状态；必要时可通过服务商控制台选择旧内核启动。')
     def closeEvent(self,event):
+        if getattr(self,'bbr_dialog',None) is not None and self.bbr_dialog.running():
+            event.ignore();return
         if self.active and self.active.isRunning():
             QMessageBox.information(self,'任务进行中','请等待当前操作结束后再关闭。服务器安装任务可在连接断开后继续运行。'); event.ignore(); return
         for engine in self.tunnels:engine.close()
@@ -702,6 +706,21 @@ def main():
             QTimer.singleShot(150,confirm_startup)
             assert window.system_notice()
             window.grab().save(os.environ['NODEPILOT_SMOKE_TEST'])
+            if os.environ.get('NODEPILOT_SMOKE_BBR'):
+                from .bbr_ui import BbrDialog
+                from .bbr_interactive import script_bytes
+                assert script_bytes()
+                dialog=BbrDialog(window,Settings(host='192.0.2.1',ssh_port=22))
+                assert dialog.choices.count()==12 and not dialog.input.isEnabled()
+                dialog.choices.setCurrentRow(1)
+                assert dialog.input.text()=='2'
+                dialog.ready();dialog.append_output('请选择一个操作 (1-12)：')
+                assert dialog.input.isEnabled()
+                dialog.show();app.processEvents()
+                dialog.grab().save(str(Path(os.environ['NODEPILOT_SMOKE_TEST']).with_suffix('.bbr.png')))
+                dialog.ended(0,'脚本已退出')
+                assert not dialog.input.isEnabled()
+                dialog.reject()
             app.quit()
         QTimer.singleShot(300,smoke)
     app.exec()

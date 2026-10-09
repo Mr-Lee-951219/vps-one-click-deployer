@@ -16,4 +16,4 @@ Source: https://github.com/byJoey/Actions-bbr-v3
 Pinned source commit: 5f10347280095b41f8597d974b9d7ad3ffa4fe2a
 Standard kernel release: x86_64-7.2.9
 License: assets/Actions-bbr-v3-LICENSE
-Software downloads the standard linux-image release directly, verifying its recorded SHA-256. The bundled upstream script is for source reference; the interactive installer is not executed.
+Automatic deployment downloads the standard linux-image release directly, verifying its recorded SHA-256. Maintenance also offers the unmodified bundled upstream script as an interactive SSH PTY menu. Its SHA-256 is verified locally and remotely before execution; the script's own selected install/tuning operations are used. Script SHA-256: b49b5fe5cd21a41d7c465163ef52deafd781b0db70a0ffec180f915dfd14287e.

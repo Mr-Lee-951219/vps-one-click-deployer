@@ -75,6 +75,11 @@ QComboBox::down-arrow { image:url(@ICONS@/chevron.svg); width:16px; height:16px;
 QComboBox QAbstractItemView { background:white; color:#353540; border:1px solid #e1e1e8; border-radius:10px; padding:6px; outline:0; selection-background-color:#fbe6ee; selection-color:#af2249; }
 QComboBox QAbstractItemView::item { min-height:36px; padding:4px 10px; border-radius:6px; border:0; }
 QComboBox QAbstractItemView::item:hover, QComboBox QAbstractItemView::item:selected { background:#fbe6ee; color:#af2249; }
+QListWidget#bbrChoices { background:transparent; border:0; outline:0; selection-background-color:#fbe6ee; selection-color:#af2249; }
+QListWidget#bbrChoices::item { padding:10px 8px; min-height:24px; border-radius:8px; margin:2px 0; }
+QListWidget#bbrChoices::item:hover { background:#faf0f4; }
+QListWidget#bbrChoices::item:selected { background:#fbe6ee; color:#af2249; }
+QListWidget#bbrChoices::item:focus { border:1px solid #d62f59; }
 QCheckBox { spacing:9px; padding:4px 0; }
 QCheckBox::indicator { width:16px; height:16px; border:1px solid #b9bac6; border-radius:5px; background:white; }
 QCheckBox::indicator:hover { border-color:#d62f59; }

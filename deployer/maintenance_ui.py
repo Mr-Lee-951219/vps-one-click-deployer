@@ -119,7 +119,7 @@ class MaintenanceUi(SecurityUi):
         card=section('BBR 管理','TCP BBR 与 HY2 QUIC 分开显示。安装内核后需要重启，只有状态检查通过才标记生效。',[
             ('刷新当前 BBR 状态',lambda:self.start('current_bbr')),
             ('启用系统内核 BBR',lambda:self.confirm_action('native_bbr','会启用当前内核的 TCP BBR + FQ 并保存原参数。原版 Debian 12 的 6.1 内核为 BBRv1；不会更换运行内核。')),
-            ('安装 byJoey BBRv3',lambda:self.confirm_action('install_bbr','会安装固定版本的第三方内核，保留旧内核；完成后需另行重启。')),
+            ('安装 / 管理 byJoey BBRv3',self.bbr_menu_dialog),
             ('重启以应用 BBRv3',self.reboot_bbr_dialog),
             ('恢复原 TCP 参数',lambda:self.confirm_action('restore_bbr','恢复部署前保存的算法与队列；不会卸载当前内核。'))])
         self.bbr_summary=hint('尚未读取当前 BBR 状态');card.area.insertWidget(1,self.bbr_summary)
@@ -154,6 +154,19 @@ class MaintenanceUi(SecurityUi):
         text='目标服务器：'+self.target_text()+'\n\n'+description
         if QMessageBox.question(self,'确认操作',text,QMessageBox.Yes|QMessageBox.No,QMessageBox.No)==QMessageBox.Yes:
             self.start(action,payload)
+
+    def bbr_menu_dialog(self):
+        if self.active and self.active.isRunning():
+            QMessageBox.information(self,'任务进行中','请等待当前任务结束。');return
+        try:
+            settings=self.settings(False)
+            if not settings.host or not settings.ssh_port:raise ValueError('请先填写服务器地址和 SSH 端口')
+            if not settings.password and not settings.private_key:raise ValueError('请先填写 SSH 密码或选择已保存服务器')
+            from .bbr_ui import BbrDialog
+            self.bbr_dialog=BbrDialog(self,settings)
+            self.bbr_dialog.exec()
+            self.bbr_dialog.deleteLater();self.bbr_dialog=None
+        except Exception as ex:QMessageBox.warning(self,'请检查连接信息',str(ex))
 
     def saved_servers_dialog(self):
         if self.active and self.active.isRunning():
