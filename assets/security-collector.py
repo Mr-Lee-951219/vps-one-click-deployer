@@ -11,8 +11,21 @@ from pathlib import Path
 
 ROOT = Path('/var/lib/nodepilot/security')
 JAIL = 'nodepilot-sshd'
+SCOPE = 'ssh'
+JAIL_FILE = '/etc/fail2ban/jail.d/nodepilot-sshd.local'
 BEIJING = timezone(timedelta(hours=8))
 EVENT = re.compile(r'\[' + JAIL + r'\]\s+(Found|Ban|Unban)\s+(\S+)')
+
+
+def set_scope(scope):
+    global ROOT, JAIL, EVENT, SCOPE, JAIL_FILE
+    if scope not in ('ssh', 'panel'):
+        raise ValueError('防护对象无效')
+    SCOPE = scope
+    ROOT = Path('/var/lib/nodepilot/security' + ('/panel' if scope == 'panel' else ''))
+    JAIL = 'nodepilot-panel' if scope == 'panel' else 'nodepilot-sshd'
+    JAIL_FILE = '/etc/fail2ban/jail.d/' + JAIL + '.local'
+    EVENT = re.compile(r'\[' + JAIL + r'\]\s+(Found|Ban|Unban)\s+(\S+)')
 
 
 def parse_event(line, timestamp=None):
@@ -158,7 +171,7 @@ def report(db, days):
             except ValueError:
                 pass
     result = summarize(db, days, active)
-    state_error = code != 0 and Path('/etc/fail2ban/jail.d/nodepilot-sshd.local').exists()
+    state_error = code != 0 and Path(JAIL_FILE).exists()
     if state_error:
         result['metrics']['currently_banned'] = None
         for row in result['rows']:
@@ -167,9 +180,9 @@ def report(db, days):
     _, service = command(['systemctl', 'is-active', 'fail2ban'])
     _, collector = command(['systemctl', 'is-active', 'nodepilot-security-stats.timer'])
     policy = json.loads((ROOT / 'policy.json').read_text()) if (ROOT / 'policy.json').exists() else {}
-    result.update(enabled=code == 0, installed=True, state_error=state_error, service=service, collector=collector, policy=policy,
+    result.update(scope=SCOPE, enabled=code == 0, installed=True, state_error=state_error, service=service, collector=collector, policy=policy,
                   ban_times=ban_times, updated=get_meta(db, 'updated'), started=get_meta(db, 'started'),
-                  source=get_meta(db, 'source'), note='统计 SSH 登录失败日志；失败不一定是恶意爆破。历史保留 90 天，IP 去重；明细最多 200 行。')
+                  source=get_meta(db, 'source'), note='统计 ' + ('3x-ui 面板' if SCOPE == 'panel' else 'SSH') + ' 登录失败日志；失败不一定是恶意爆破。历史保留 90 天，IP 去重；明细最多 200 行。')
     if state_error:
         result['note'] += ' 防护规则已配置，但 Fail2ban 状态读取失败，请检查服务日志；当前封禁数量未知。'
     return result
@@ -179,14 +192,28 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--collect', action='store_true')
     parser.add_argument('--days', type=int, choices=(1, 7, 30, 90), default=1)
+    parser.add_argument('--scope', choices=('ssh', 'panel'), default='ssh')
+    parser.add_argument('--all', action='store_true')
     args = parser.parse_args()
-    db = connect_db()
-    try:
-        collect(db)
-        if not args.collect:
-            print(json.dumps(report(db, args.days), ensure_ascii=False))
-    finally:
-        db.close()
+    if args.all and not args.collect:
+        parser.error('--all is only used for collection')
+    scopes = ('ssh', 'panel') if args.all else (args.scope,)
+    errors = []
+    for scope in scopes:
+        set_scope(scope)
+        if args.all and not (ROOT / 'policy.json').exists():
+            continue
+        db = connect_db(ROOT)
+        try:
+            collect(db)
+            if not args.collect:
+                print(json.dumps(report(db, args.days), ensure_ascii=False))
+        except Exception as ex:
+            errors.append(scope + ': ' + str(ex))
+        finally:
+            db.close()
+    if errors:
+        raise RuntimeError('; '.join(errors))
 
 
 if __name__ == '__main__':

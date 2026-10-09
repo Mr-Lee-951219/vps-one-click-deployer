@@ -109,7 +109,9 @@ class MaintenanceMixin:
                 self.log('TCP 状态已读取；HY2 配置暂无法读取：' + self.redact(str(ex)))
         self.log(status['label'] + '\n运行内核：' + status['kernel'] + '\nTCP 算法：' + status['algorithm'] + '；默认队列：' + status['qdisc'] + '\n实际网卡：' + status.get('interface','未读取') + '；实际队列：' + (status.get('actual_qdisc') or '未确认'))
         self.log('BBR 版本：'+('BBRv'+status['bbr_version'] if status['bbr_version'] else '未确认')+'\n识别依据：'+status['version_evidence'])
-        self.log('byJoey 内核已安装：' + ('是' if status['installed'] else '否') + '；需要重启：' + ('是' if status['reboot_required'] else '否'))
+        self.log('软件指定的 byJoey 内核（' + status['target_kernel'] + '）已安装：' + ('是' if status['installed'] else '否') + '；此版本待重启：' + ('是' if status['reboot_required'] else '否'))
+        if not status['installed']:
+            self.log('未检测到指定版本，不代表没有安装其他 BBRv3 内核；当前生效版本以运行内核和模块检查为准。')
         self.log('HY2 QUIC：' + json.dumps(status['hy2'], ensure_ascii=False))
         return status
 

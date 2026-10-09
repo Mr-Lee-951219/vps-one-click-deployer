@@ -553,6 +553,9 @@ class Window(MaintenanceUi, QMainWindow):
             names['change_panel_login']='修改面板账号密码'
             names.update(security_status='查看防爆破统计',security_apply='启用 SSH 防爆破',security_disable='停用 SSH 防爆破',security_unban='解除 SSH 封禁',security_restore='恢复防爆破规则',resume_deploy='继续未完成部署',network_diagnosis='限量测速与重传诊断')
             names.update(configure_public_panel='配置公网 HTTPS 面板',disable_public_panel='关闭公网面板',renew_public_panel_certificate='更新公网面板证书')
+            if action.startswith('security_') and payload:
+                name='3x-ui 面板' if payload.get('scope')=='panel' else 'SSH'
+                names.update(security_apply='启用 '+name+' 防爆破',security_disable='停用 '+name+' 防爆破',security_unban='解除 '+name+' 封禁',security_status='查看 '+name+' 防护统计',security_restore='恢复 '+name+' 防护规则')
             self.action_name=names.get(action,'恢复备份');self.started_at=time.monotonic();self.elapsed.setText('00:00');self.timer.start()
             self.progress.setRange(0,100 if action=='deploy' else 0);self.progress.setValue(0)
             self.append_log('开始'+self.action_name+' · 服务器 '+s.host+' · SSH '+str(s.ssh_port))
@@ -627,7 +630,7 @@ class Window(MaintenanceUi, QMainWindow):
             if action=='reboot_bbr':self.state.setText('服务器正在重启 · 稍后验证 BBRv3');QMessageBox.information(self,'已安排重启',text)
     def render_bbr_status(self,result):
         quic='；'.join(str(x['node'])+'：'+str(x['congestion']).upper() for x in result.get('hy2',[])) or '没有读取到 HY2 配置'
-        self.bbr_summary.setText(result['label']+'\nBBR 版本：'+('BBRv'+result['bbr_version'] if result.get('bbr_version') else '未确认')+'\n识别依据：'+result.get('version_evidence','未读取')+'\n运行内核：'+result['kernel']+'\nTCP：'+result['algorithm']+' · 默认队列：'+result['qdisc']+'\n实际网卡：'+(result.get('interface') or '未读取')+' · 实际队列：'+(result.get('actual_qdisc') or '未确认')+'\nbyJoey 已安装：'+('是' if result.get('installed') else '否')+'；待重启：'+('是' if result.get('reboot_required') else '否')+'\nHY2 QUIC：'+quic)
+        self.bbr_summary.setText(result['label']+'\nBBR 版本：'+('BBRv'+result['bbr_version'] if result.get('bbr_version') else '未确认')+'\n识别依据：'+result.get('version_evidence','未读取')+'\n运行内核：'+result['kernel']+'\nTCP：'+result['algorithm']+' · 默认队列：'+result['qdisc']+'\n实际网卡：'+(result.get('interface') or '未读取')+' · 实际队列：'+(result.get('actual_qdisc') or '未确认')+'\n指定 byJoey 内核：'+result.get('target_kernel','未读取')+'\n指定版本已安装：'+('是' if result.get('installed') else '否')+'；此版本待重启：'+('是' if result.get('reboot_required') else '否')+('\n其他版本需另行核对；当前生效版本以运行内核检查为准。' if not result.get('installed') else '')+'\nHY2 QUIC：'+quic)
     def show_record(self,r):
         ports=r['ports']; self.summary.setText(r['settings']['host']+' · 已部署 · 3x-ui v3.9.0  |  TCP '+r.get('bbr','待检查')+'\n'+ '   ·   '.join(k.upper()+': '+str(v) for k,v in ports.items()))
         if r.get('bbrv3'):self.summary.setText(self.summary.text()+'\nbyJoey BBRv3：'+('已验证生效' if r['bbrv3'].get('active') else '尚未生效，请重启后验证'))
